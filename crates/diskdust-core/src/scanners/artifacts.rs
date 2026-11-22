@@ -137,6 +137,7 @@ impl Scanner for BuildArtifactsScanner {
                     detail: with_shared_note(kind.detail().to_owned(), &report),
                     path: Some(path.clone()),
                     bytes: Some(report.bytes),
+                    last_modified: report.newest,
                     risk: kind.risk(),
                     action: Some(CleanupAction::RemovePath { path: path.clone(), root: root.clone() }),
                     specificity: SPECIFIC,

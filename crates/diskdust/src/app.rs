@@ -16,6 +16,7 @@ use egui::{Align, Color32, Layout, RichText, Sense, vec2};
 use egui_extras::{Column, TableBuilder};
 
 use crate::format;
+use crate::settings::{Settings, SettingsStore};
 use crate::worker::{self, CleanResult, Msg, Notifier};
 
 const SAFE: Color32 = Color32::from_rgb(102, 187, 106);
@@ -25,6 +26,10 @@ const ADMIN: Color32 = Color32::from_rgb(100, 181, 246);
 const DANGER: Color32 = Color32::from_rgb(229, 115, 115);
 const ACCENT: Color32 = Color32::from_rgb(126, 87, 194);
 const MAX_ACTIVITY: usize = 300;
+/// Entries shown in the History window.
+const HISTORY_LIMIT: usize = 300;
+/// Choices of the "last modified" filter, in days (`None` = any age).
+const AGE_FILTERS: [Option<u32>; 5] = [None, Some(7), Some(30), Some(90), Some(180)];
 
 // Every icon the UI draws. They must exist in the bundled fonts (see `all_icons_have_glyphs`).
 const ICON_REMOVE: &str = "×";
@@ -81,23 +86,47 @@ pub struct DiskdustApp {
     selected: HashSet<String>,
     category: Option<Category>,
     search: String,
+    /// Only show items not modified for at least this many days.
+    older_than: Option<u32>,
+    /// Finding ids the user chose to ignore (persisted).
+    ignored: std::collections::BTreeSet<String>,
+    show_ignored: bool,
+    /// True once the user edited the project folders (then they are persisted).
+    roots_customized: bool,
+    store: SettingsStore,
+    /// Last settings written, to save only on change.
+    saved: Settings,
+    /// Finding shown in the details panel.
+    details: Option<String>,
+    breakdown: Breakdown,
+    /// Free / total space of the home volume.
+    disk: Option<diskdust_core::disk::DiskSpace>,
+    /// Offer "Empty Trash" after a clean moved items there.
+    offer_empty_trash: bool,
+    /// Entries shown in the History window, when open.
+    history: Option<Vec<diskdust_core::audit::AuditEntry>>,
+    /// macOS Full Disk Access as probed at start; `None` once dismissed or when not applicable.
+    full_disk_access: Option<bool>,
     mode: DeleteMode,
     project_roots: Vec<PathBuf>,
     phase: Phase,
     cancel: Arc<AtomicBool>,
     notifier: Notifier,
     rx: Receiver<Msg>,
-    confirm_open: bool,
+    /// Open confirmation dialog, if any.
+    dialog: Option<Dialog>,
     activity: Vec<Activity>,
     status: String,
     tally: CleanTally,
 }
 
 impl DiskdustApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, os: Os, home: PathBuf) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, os: Os, home: PathBuf, store: SettingsStore) -> Self {
         configure_style(&cc.egui_ctx);
         let (tx, rx) = channel();
-        let project_roots = default_project_roots(&home);
+        let saved = store.load();
+        let roots_customized = saved.project_roots.is_some();
+        let project_roots = saved.project_roots.clone().map_or_else(|| default_project_roots(&home), unique_dirs);
         Self {
             os,
             home,
@@ -105,16 +134,319 @@ impl DiskdustApp {
             selected: HashSet::new(),
             category: None,
             search: String::new(),
-            mode: DeleteMode::Trash,
+            older_than: saved.older_than,
+            ignored: saved.ignored.clone(),
+            show_ignored: false,
+            roots_customized,
+            store,
+            mode: saved.mode.unwrap_or(DeleteMode::Trash),
             project_roots,
             phase: Phase::Welcome,
             cancel: Arc::new(AtomicBool::new(false)),
             notifier: Notifier::new(tx, cc.egui_ctx.clone()),
             rx,
-            confirm_open: false,
+            dialog: None,
             activity: Vec::new(),
             status: "Ready. Scanning only reads; nothing is removed until you confirm.".to_owned(),
             tally: CleanTally::default(),
+            saved,
+            details: None,
+            breakdown: Breakdown::None,
+            disk: None,
+            offer_empty_trash: false,
+            history: None,
+            full_disk_access: None,
+        }
+        .with_disk_space()
+        .with_access_probe()
+    }
+
+    fn with_access_probe(mut self) -> Self {
+        self.full_disk_access = diskdust_core::access::has_full_disk_access(self.os, &self.home);
+        self
+    }
+
+    /// Explains what is missing without Full Disk Access and links to the setting.
+    fn access_banner(&mut self, ui: &mut egui::Ui) {
+        if self.full_disk_access != Some(false) {
+            return;
+        }
+        egui::Frame::new()
+            .fill(SURFACE)
+            .stroke(egui::Stroke::new(1.0, ADMIN))
+            .corner_radius(6.0)
+            .inner_margin(10.0)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(
+                            "diskdust cannot read your Trash and some app data without Full Disk Access, so their \
+                             sizes show as unknown.",
+                        )
+                        .color(ADMIN),
+                    );
+                    if ui.button("Open Privacy settings").clicked()
+                        && let Err(e) = opener::open(diskdust_core::access::FULL_DISK_ACCESS_SETTINGS)
+                    {
+                        self.log(false, format!("Could not open System Settings: {e}"));
+                    }
+                    if ui.button("Dismiss").clicked() {
+                        self.full_disk_access = None;
+                    }
+                });
+            });
+        ui.add_space(6.0);
+    }
+
+    fn with_disk_space(mut self) -> Self {
+        self.refresh_disk();
+        self
+    }
+
+    fn refresh_disk(&mut self) {
+        self.disk = diskdust_core::disk::space(&self.home);
+    }
+
+    fn open_history(&mut self) {
+        let log = crate::session::default_audit_log(self.os, &self.home);
+        match log.read_recent(HISTORY_LIMIT) {
+            Ok(entries) => self.history = Some(entries),
+            Err(e) => self.log(false, format!("Could not read {}: {e}", log.path().display())),
+        }
+    }
+
+    fn start_empty_trash(&mut self) {
+        self.offer_empty_trash = false;
+        self.tally = CleanTally::default();
+        self.phase = Phase::Cleaning { total: 1, done: 0 };
+        "Emptying the Trash…".clone_into(&mut self.status);
+        worker::spawn_empty_trash(self.os, self.home.clone(), self.notifier.clone());
+    }
+
+    fn history_window(&mut self, ctx: &egui::Context) {
+        let Some(entries) = &self.history else { return };
+        let mut open = true;
+        egui::Window::new("Cleanup history")
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_TOP, vec2(0.0, 70.0))
+            .min_width(640.0)
+            .min_height(240.0)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                if entries.is_empty() {
+                    ui.label(RichText::new("Nothing has been cleaned yet.").weak());
+                    return;
+                }
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    egui::Grid::new("history-grid").striped(true).num_columns(4).spacing(vec2(12.0, 4.0)).show(
+                        ui,
+                        |ui| {
+                            for e in entries {
+                                ui.label(
+                                    RichText::new(e.timestamp.get(..16).unwrap_or(&e.timestamp).replace('T', " "))
+                                        .small(),
+                                );
+                                let (icon, color) = if e.ok { (ICON_OK, SAFE) } else { (ICON_FAIL, DANGER) };
+                                ui.label(RichText::new(icon).color(color));
+                                ui.label(&e.title).on_hover_text(&e.message);
+                                ui.label(RichText::new(format::maybe_bytes(e.bytes)).small());
+                                ui.end_row();
+                            }
+                        },
+                    );
+                });
+            });
+        if !open {
+            self.history = None;
+        }
+    }
+
+    fn empty_trash_modal(&mut self, ctx: &egui::Context) {
+        let mut confirmed = false;
+        let mut cancelled = false;
+        let modal = egui::Modal::new(egui::Id::unique("empty-trash")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.heading("Empty the Trash?");
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(
+                    "Everything in the Trash is deleted permanently, including items you moved there before. \
+                     This cannot be undone.",
+                )
+                .color(DANGER),
+            );
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new(RichText::new("Empty Trash").strong()).fill(DANGER)).clicked() {
+                    confirmed = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancelled = true;
+                }
+            });
+        });
+        if confirmed {
+            self.dialog = None;
+            self.start_empty_trash();
+        } else if cancelled || modal.should_close() {
+            self.dialog = None;
+        }
+    }
+
+    fn current_settings(&self) -> Settings {
+        Settings {
+            project_roots: self.roots_customized.then(|| self.project_roots.clone()),
+            mode: Some(self.mode),
+            older_than: self.older_than,
+            ignored: self.ignored.clone(),
+        }
+    }
+
+    /// Saves settings when they changed since the last write.
+    fn persist(&mut self) {
+        let current = self.current_settings();
+        let unchanged = current.project_roots == self.saved.project_roots
+            && current.mode.unwrap_or(DeleteMode::Trash) == self.saved.mode.unwrap_or(DeleteMode::Trash)
+            && current.older_than == self.saved.older_than
+            && current.ignored == self.saved.ignored;
+        if unchanged {
+            return;
+        }
+        if let Err(e) = self.store.save(&current) {
+            tracing::warn!(error = %e, "could not save settings");
+        }
+        self.saved = current;
+    }
+
+    fn open_details(&mut self, id: String) {
+        if self.details.as_ref() != Some(&id) {
+            self.breakdown = Breakdown::None;
+        }
+        self.details = Some(id);
+    }
+
+    fn close_details(&mut self) {
+        self.details = None;
+        self.breakdown = Breakdown::None;
+    }
+
+    fn request_breakdown(&mut self, id: String, path: PathBuf) {
+        self.breakdown = Breakdown::Loading(id.clone());
+        worker::spawn_breakdown(id, path, self.notifier.clone());
+    }
+
+    /// Right-hand panel describing the finding picked in the table.
+    fn details_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(f) = self.details.as_ref().and_then(|id| self.findings.iter().find(|f| &f.id == id)).cloned() else {
+            return;
+        };
+        let mut action = None;
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.heading(RichText::new(&f.title).strong());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button("Close").clicked() {
+                    action = Some(DetailsAction::Close);
+                }
+            });
+        });
+        ui.horizontal_wrapped(|ui| {
+            risk_cell(ui, &f);
+            ui.label(RichText::new(f.category.label()).weak());
+            if f.privilege == Privilege::Admin {
+                ui.label(RichText::new(format!("{ICON_LOCK} admin")).color(ADMIN));
+            }
+        });
+        ui.add_space(6.0);
+        egui::Grid::new("details-grid").num_columns(2).spacing(vec2(10.0, 4.0)).show(ui, |ui| {
+            ui.label(RichText::new("Size").weak());
+            ui.label(format::maybe_bytes(f.bytes));
+            ui.end_row();
+            ui.label(RichText::new("Modified").weak());
+            ui.label(format::age(f.age_days(format::now_unix())));
+            ui.end_row();
+            if let Some(path) = &f.path {
+                ui.label(RichText::new("Path").weak());
+                ui.label(RichText::new(display_path(path, &self.home)).small())
+                    .on_hover_text(path.display().to_string());
+                ui.end_row();
+            }
+            ui.label(RichText::new("Cleaning").weak());
+            ui.label(action_description(&f, self.mode));
+            ui.end_row();
+        });
+        ui.add_space(6.0);
+        ui.label(&f.detail);
+        if let Some(quit) = &f.quit_first {
+            ui.add_space(4.0);
+            ui.label(RichText::new(format!("{ICON_WARN} Quit {} before cleaning.", quit.app)).color(REVIEW));
+        }
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            if let Some(path) = &f.path
+                && ui.button("Reveal").clicked()
+            {
+                action = Some(DetailsAction::Row(RowAction::Reveal(path.clone())));
+            }
+            let ignore = if self.ignored.contains(&f.id) { "Stop ignoring" } else { "Ignore" };
+            if ui.button(ignore).clicked() {
+                action = Some(DetailsAction::Row(RowAction::ToggleIgnore(f.id.clone())));
+            }
+            if let Some(path) = f.path.as_ref().filter(|p| p.is_dir())
+                && ui
+                    .add_enabled(!matches!(self.breakdown, Breakdown::Loading(_)), egui::Button::new("Largest folders"))
+                    .clicked()
+            {
+                action = Some(DetailsAction::Breakdown(path.clone()));
+            }
+        });
+        match &self.breakdown {
+            Breakdown::Loading(id) if *id == f.id => {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Measuring…");
+                });
+            }
+            Breakdown::Ready(id, entries) if *id == f.id => {
+                ui.add_space(6.0);
+                ui.label(RichText::new("Largest folders").strong());
+                let max = entries.first().map_or(1, |(_, b)| (*b).max(1));
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for (path, bytes) in entries {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(file_name_of(path)).small())
+                                .on_hover_text(path.display().to_string());
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(RichText::new(format::bytes(*bytes)).small());
+                            });
+                        });
+                        #[allow(clippy::cast_precision_loss)]
+                        size_bar(ui, *bytes as f32 / max as f32);
+                    }
+                    if entries.is_empty() {
+                        ui.label(RichText::new("No sub-folders to show.").weak());
+                    }
+                });
+            }
+            _ => {}
+        }
+        match action {
+            Some(DetailsAction::Close) => self.close_details(),
+            Some(DetailsAction::Row(row)) => self.apply(row),
+            Some(DetailsAction::Breakdown(path)) => self.request_breakdown(f.id.clone(), path),
+            None => {}
+        }
+    }
+
+    fn is_ignored(&self, f: &Finding) -> bool {
+        self.ignored.contains(&f.id)
+    }
+
+    fn toggle_ignored(&mut self, id: &str) {
+        if !self.ignored.remove(id) {
+            self.ignored.insert(id.to_owned());
+            self.selected.remove(id);
         }
     }
 
@@ -169,6 +501,9 @@ impl DiskdustApp {
                 Msg::ScanDone { findings, elapsed, cancelled } => {
                     self.selected.retain(|id| findings.iter().any(|f| &f.id == id));
                     self.findings = findings;
+                    if self.details.as_ref().is_some_and(|id| !self.findings.iter().any(|f| &f.id == id)) {
+                        self.close_details();
+                    }
                     let total: u64 =
                         self.findings.iter().filter(|f| f.is_actionable()).map(Finding::bytes_or_zero).sum();
                     self.status = format!(
@@ -179,11 +514,22 @@ impl DiskdustApp {
                         format::bytes(total)
                     );
                     self.phase = Phase::Idle;
+                    self.refresh_disk();
                 }
                 Msg::Cleaned(result) => self.on_cleaned(&result),
+                Msg::Breakdown { id, entries } => {
+                    if self.details.as_deref() == Some(id.as_str()) {
+                        self.breakdown = Breakdown::Ready(id, entries);
+                    }
+                }
                 Msg::CleanDone => {
                     self.status = clean_summary(&self.tally);
                     self.phase = Phase::Idle;
+                    self.offer_empty_trash = self.tally.trashed > 0;
+                    self.refresh_disk();
+                    if self.history.is_some() {
+                        self.open_history();
+                    }
                 }
             }
         }
@@ -218,6 +564,9 @@ impl DiskdustApp {
             }
             self.findings.retain(|f| f.id != r.id);
             self.selected.remove(&r.id);
+            if self.details.as_deref() == Some(r.id.as_str()) {
+                self.close_details();
+            }
         } else {
             self.tally.failed += 1;
         }
@@ -226,10 +575,15 @@ impl DiskdustApp {
 
     fn visible(&self) -> Vec<usize> {
         let needle = self.search.to_lowercase();
+        let now = format::now_unix();
         self.findings
             .iter()
             .enumerate()
             .filter(|(_, f)| self.category.is_none_or(|c| f.category == c))
+            .filter(|(_, f)| self.show_ignored || !self.is_ignored(f))
+            .filter(|(_, f)| {
+                self.older_than.is_none_or(|days| f.age_days(now).is_some_and(|age| age >= u64::from(days)))
+            })
             .filter(|(_, f)| {
                 needle.is_empty()
                     || f.title.to_lowercase().contains(&needle)
@@ -244,7 +598,7 @@ impl DiskdustApp {
     fn select_visible(&mut self, keep: impl Fn(&Finding) -> bool) {
         for i in self.visible() {
             let f = &self.findings[i];
-            if f.is_actionable() && keep(f) {
+            if f.is_actionable() && !self.is_ignored(f) && keep(f) {
                 self.selected.insert(f.id.clone());
             }
         }
@@ -264,6 +618,11 @@ impl DiskdustApp {
         ui.horizontal(|ui| {
             ui.label(RichText::new("diskdust").size(22.0).strong().color(ACCENT));
             ui.label(RichText::new("find and reclaim hidden disk space").weak());
+            if let Some(disk) = self.disk {
+                ui.separator();
+                ui.label(format!("{} free of {}", format::bytes(disk.available), format::bytes(disk.total)))
+                    .on_hover_text("Space available on the volume holding your home folder");
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let (count, bytes) = self.selection_summary();
                 let clean_label = if count == 0 {
@@ -277,7 +636,7 @@ impl DiskdustApp {
                     ui.visuals().widgets.inactive.weak_bg_fill
                 });
                 if ui.add_enabled(count > 0 && !self.busy(), clean).clicked() {
-                    self.confirm_open = true;
+                    self.dialog = Some(Dialog::ConfirmClean);
                 }
                 ui.separator();
                 ui.selectable_value(&mut self.mode, DeleteMode::Permanent, "Delete permanently")
@@ -285,6 +644,9 @@ impl DiskdustApp {
                 ui.selectable_value(&mut self.mode, DeleteMode::Trash, "Move to Trash")
                     .on_hover_text("Recoverable. Space is reclaimed when you empty the Trash.");
                 ui.separator();
+                if ui.button("History").on_hover_text("Previous cleanups (from the audit log)").clicked() {
+                    self.open_history();
+                }
                 if let Phase::Scanning { .. } = self.phase {
                     if ui.button("Cancel scan").clicked() {
                         self.cancel.store(true, Ordering::Relaxed);
@@ -304,7 +666,7 @@ impl DiskdustApp {
         ui.add_space(8.0);
         let mut totals: BTreeMap<Category, Totals> = BTreeMap::new();
         let mut all = Totals::default();
-        for f in &self.findings {
+        for f in self.findings.iter().filter(|f| !self.is_ignored(f)) {
             totals.entry(f.category).or_default().add(f);
             all.add(f);
         }
@@ -358,6 +720,7 @@ impl DiskdustApp {
         }
         if let Some(i) = remove {
             self.project_roots.remove(i);
+            self.roots_customized = true;
         }
         if ui.add_enabled(!self.busy(), egui::Button::new("Add folder…")).clicked()
             && let Some(folder) = rfd::FileDialog::new().set_directory(&self.home).pick_folder()
@@ -365,6 +728,7 @@ impl DiskdustApp {
             let mut roots = self.project_roots.clone();
             roots.push(folder);
             self.project_roots = unique_dirs(roots);
+            self.roots_customized = true;
         }
     }
 
@@ -389,6 +753,9 @@ impl DiskdustApp {
             }
             Phase::Idle | Phase::Welcome => {
                 ui.label(&self.status);
+                if self.offer_empty_trash && ui.button("Empty Trash…").clicked() {
+                    self.dialog = Some(Dialog::EmptyTrash);
+                }
             }
         });
         egui::CollapsingHeader::new(format!("Activity ({})", self.activity.len())).id_salt("activity").show(ui, |ui| {
@@ -439,11 +806,24 @@ impl DiskdustApp {
             ui.add(
                 egui::TextEdit::singleline(&mut self.search).hint_text("Filter by name or path…").desired_width(280.0),
             );
+            egui::ComboBox::from_id_salt("age-filter")
+                .selected_text(age_filter_label(self.older_than))
+                .show_ui(ui, |ui| {
+                    for choice in AGE_FILTERS {
+                        ui.selectable_value(&mut self.older_than, choice, age_filter_label(choice));
+                    }
+                })
+                .response
+                .on_hover_text("Show only items whose newest file or folder is at least this old");
             let mut shown = Totals::default();
             for i in visible {
                 shown.add(&self.findings[*i]);
             }
             ui.label(RichText::new(format!("{} · {} reclaimable", format::items(shown.count), shown.label())).weak());
+            let ignored = self.findings.iter().filter(|f| self.is_ignored(f)).count();
+            if ignored > 0 || self.show_ignored {
+                ui.checkbox(&mut self.show_ignored, format!("Show ignored ({ignored})"));
+            }
         });
         ui.add_space(4.0);
     }
@@ -472,82 +852,125 @@ impl DiskdustApp {
             .unwrap_or(1)
             .max(1);
         let busy = self.busy();
+        let now = format::now_unix();
         let text_height = ui.text_style_height(&egui::TextStyle::Body);
         let row_height = text_height * 2.0 + 14.0;
-        let mut reveal = None;
-        TableBuilder::new(ui)
+        let mut actions = Vec::new();
+        // With the details panel open the Category column is dropped (the panel shows it), so Size
+        // and Modified stay visible; each layout keeps its own column widths.
+        let compact = self.details.is_some();
+        let mut table = TableBuilder::new(ui)
+            .id_salt(if compact { "results-compact" } else { "results" })
             .striped(true)
             .resizable(true)
             .cell_layout(Layout::left_to_right(Align::Center))
             .column(Column::exact(26.0))
-            .column(Column::remainder().at_least(260.0).clip(true))
-            .column(Column::initial(140.0).at_least(90.0))
+            .column(Column::remainder().at_least(if compact { 180.0 } else { 260.0 }).clip(true));
+        if !compact {
+            table = table.column(Column::initial(140.0).at_least(90.0));
+        }
+        let titles: &[&str] = if compact {
+            &["", "Item", "Risk", "Size", "Modified", ""]
+        } else {
+            &["", "Item", "Category", "Risk", "Size", "Modified", ""]
+        };
+        table
             .column(Column::exact(78.0))
-            .column(Column::initial(150.0).at_least(120.0))
+            .column(Column::initial(130.0).at_least(100.0))
+            .column(Column::initial(100.0).at_least(80.0))
             .column(Column::exact(34.0))
             .header(22.0, |mut header| {
-                header.col(|_| {});
-                header.col(|ui| {
-                    ui.strong("Item");
-                });
-                header.col(|ui| {
-                    ui.strong("Category");
-                });
-                header.col(|ui| {
-                    ui.strong("Risk");
-                });
-                header.col(|ui| {
-                    ui.strong("Size");
-                });
-                header.col(|_| {});
+                for &title in titles {
+                    header.col(|ui| {
+                        ui.strong(title);
+                    });
+                }
             })
             .body(|body| {
-                body.rows(row_height, visible.len(), |mut row| {
+                body.rows(row_height, visible.len(), |row| {
                     let f = &self.findings[visible[row.index()]];
-                    row.col(|ui| {
-                        let mut checked = self.selected.contains(&f.id);
-                        let enabled = f.is_actionable() && !busy;
-                        let response = ui.add_enabled(enabled, egui::Checkbox::without_text(&mut checked));
-                        let label = format!("Select {}", f.title);
-                        response
-                            .widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, checked, &label));
-                        if response.changed() {
-                            if checked {
-                                self.selected.insert(f.id.clone());
-                            } else {
-                                self.selected.remove(&f.id);
-                            }
-                        }
-                    });
-                    row.col(|ui| item_cell(ui, f, &self.home));
-                    row.col(|ui| {
-                        ui.label(f.category.label());
-                    });
-                    row.col(|ui| risk_cell(ui, f));
-                    row.col(|ui| size_cell(ui, f, max_bytes));
-                    row.col(|ui| {
-                        if let Some(path) = &f.path
-                            && ui.small_button(ICON_REVEAL).on_hover_text("Reveal in file manager").clicked()
-                        {
-                            reveal = Some(path.clone());
-                        }
-                    });
+                    self.table_row(row, f, RowContext { busy, now, max_bytes, compact }, &mut actions);
                 });
             });
-        if let Some(path) = reveal {
-            let target = if path.exists() { path } else { path.parent().map(PathBuf::from).unwrap_or(path) };
-            if let Err(e) = opener::reveal(&target) {
-                self.log(false, format!("Could not reveal {}: {e}", target.display()));
+        for action in actions {
+            self.apply(action);
+        }
+    }
+
+    fn table_row(&self, mut row: egui_extras::TableRow<'_, '_>, f: &Finding, rc: RowContext, out: &mut Vec<RowAction>) {
+        row.col(|ui| {
+            let mut checked = self.selected.contains(&f.id);
+            let enabled = f.is_actionable() && !rc.busy;
+            let response = ui.add_enabled(enabled, egui::Checkbox::without_text(&mut checked));
+            let label = format!("Select {}", f.title);
+            response.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, checked, &label));
+            if response.changed() {
+                out.push(RowAction::Select(f.id.clone(), checked));
+            }
+        });
+        let ignored = self.ignored.contains(&f.id);
+        row.col(|ui| {
+            let response = item_cell(ui, f, &self.home, ignored).on_hover_text("Click for details");
+            if response.clicked() {
+                out.push(RowAction::Details(f.id.clone()));
+            }
+            response.context_menu(|ui| {
+                let label = if ignored { "Stop ignoring" } else { "Ignore this item" };
+                if ui.button(label).clicked() {
+                    out.push(RowAction::ToggleIgnore(f.id.clone()));
+                    ui.close();
+                }
+            });
+        });
+        if !rc.compact {
+            row.col(|ui| {
+                ui.label(f.category.label());
+            });
+        }
+        row.col(|ui| risk_cell(ui, f));
+        row.col(|ui| size_cell(ui, f, rc.max_bytes));
+        row.col(|ui| {
+            ui.label(RichText::new(format::age(f.age_days(rc.now))).weak());
+        });
+        row.col(|ui| {
+            if let Some(path) = &f.path
+                && ui.small_button(ICON_REVEAL).on_hover_text("Reveal in file manager").clicked()
+            {
+                out.push(RowAction::Reveal(path.clone()));
+            }
+        });
+    }
+
+    fn apply(&mut self, action: RowAction) {
+        match action {
+            RowAction::Select(id, true) => {
+                self.selected.insert(id);
+            }
+            RowAction::Select(id, false) => {
+                self.selected.remove(&id);
+            }
+            RowAction::ToggleIgnore(id) => self.toggle_ignored(&id),
+            RowAction::Details(id) => self.open_details(id),
+            RowAction::Reveal(path) => {
+                let target = if path.exists() { path } else { path.parent().map(PathBuf::from).unwrap_or(path) };
+                if let Err(e) = opener::reveal(&target) {
+                    self.log(false, format!("Could not reveal {}: {e}", target.display()));
+                }
             }
         }
     }
 
     fn confirm_modal(&mut self, ctx: &egui::Context) {
-        let chosen: Vec<&Finding> = self.findings.iter().filter(|f| self.selected.contains(&f.id)).collect();
+        let chosen: Vec<&Finding> =
+            self.findings.iter().filter(|f| self.selected.contains(&f.id) && !self.is_ignored(f)).collect();
         let total: u64 = chosen.iter().map(|f| f.bytes_or_zero()).sum();
         let review = chosen.iter().filter(|f| f.risk == Risk::Review).count();
         let admin = chosen.iter().filter(|f| f.privilege == Privilege::Admin).count();
         let unknown = chosen.iter().filter(|f| f.bytes.is_none()).count();
+        let mut quit_apps: Vec<&str> =
+            chosen.iter().filter_map(|f| f.quit_first.as_ref().map(|q| q.app.as_str())).collect();
+        quit_apps.sort_unstable();
+        quit_apps.dedup();
         let permanent: Vec<&str> =
             chosen.iter().filter(|f| removed_permanently_in_trash_mode(f)).map(|f| f.title.as_str()).collect();
         let mut confirmed = false;
@@ -584,6 +1007,16 @@ impl DiskdustApp {
                     .color(REVIEW),
                 );
             }
+            if !quit_apps.is_empty() {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!(
+                        "{ICON_WARN} Quit {} first. Items of apps that are still running are skipped.",
+                        quit_apps.join(", ")
+                    ))
+                    .color(REVIEW),
+                );
+            }
             if admin > 0 {
                 ui.add_space(6.0);
                 ui.label(
@@ -610,10 +1043,10 @@ impl DiskdustApp {
             });
         });
         if confirmed {
-            self.confirm_open = false;
+            self.dialog = None;
             self.start_clean();
         } else if cancelled || modal.should_close() {
-            self.confirm_open = false;
+            self.dialog = None;
         }
     }
 }
@@ -629,18 +1062,32 @@ impl eframe::App for DiskdustApp {
         egui::Panel::left("sidebar").resizable(false).exact_size(240.0).show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| self.sidebar(ui));
         });
+        if self.details.is_some() && !matches!(self.phase, Phase::Welcome) {
+            egui::Panel::right("details").resizable(true).default_size(320.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().id_salt("details-scroll").show(ui, |ui| self.details_panel(ui));
+            });
+        }
         egui::CentralPanel::default().show(ui, |ui| {
+            self.access_banner(ui);
             if matches!(self.phase, Phase::Welcome) {
                 self.welcome(ui);
             } else {
                 self.table(ui);
             }
         });
-        if self.confirm_open {
-            let ctx = ui.ctx().clone();
-            self.confirm_modal(&ctx);
+        let ctx = ui.ctx().clone();
+        match self.dialog {
+            Some(Dialog::ConfirmClean) => self.confirm_modal(&ctx),
+            Some(Dialog::EmptyTrash) => self.empty_trash_modal(&ctx),
+            None => {}
         }
+        self.history_window(&ctx);
+        self.persist();
     }
+}
+
+fn age_filter_label(days: Option<u32>) -> String {
+    days.map_or_else(|| "Any age".to_owned(), |d| format!("Untouched {d}+ days"))
 }
 
 /// Items that bypass the Trash even in Trash mode: emptying a trash folder, tool commands
@@ -662,23 +1109,28 @@ fn permanent_warning(titles: &[&str]) -> String {
     )
 }
 
-/// macOS asks before an app reads Documents, Desktop or Downloads. Explain the prompt up front when
-/// a default project folder lives there.
+/// macOS asks before an app reads Documents, Desktop or Downloads. Explain the prompts up front:
+/// Downloads is always checked for old installers; the others when a project folder lives there.
 fn privacy_prompt_note(os: Os, home: &std::path::Path, roots: &[PathBuf]) -> Option<String> {
     if os != Os::MacOs {
         return None;
     }
-    let protected: Vec<&str> = ["Documents", "Desktop", "Downloads"]
+    let projects: Vec<&str> = ["Documents", "Desktop"]
         .into_iter()
         .filter(|name| roots.iter().any(|r| r.starts_with(home.join(name))))
         .collect();
-    (!protected.is_empty()).then(|| {
-        format!(
-            "macOS may ask to let diskdust access your {} folder: it looks for build output (target/, \
-             node_modules/, …) in project folders there. Remove the folder under Project folders to skip it.",
-            protected.join(" and ")
-        )
-    })
+    let mut note = "macOS may ask to let diskdust access your Downloads folder, where it looks for old \
+                    installers."
+        .to_owned();
+    if !projects.is_empty() {
+        let _ = write!(
+            note,
+            " It may also ask for your {} folder: project folders there are searched for build output \
+             (target/, node_modules/, …). Remove a folder under Project folders to skip it.",
+            projects.join(" and ")
+        );
+    }
+    Some(note)
 }
 
 fn clean_summary(t: &CleanTally) -> String {
@@ -711,6 +1163,68 @@ fn visuals() -> egui::Visuals {
     v.selection.bg_fill = ACCENT;
     v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, BORDER);
     v
+}
+
+/// Per-frame values shared by every table row.
+#[derive(Debug, Clone, Copy)]
+struct RowContext {
+    busy: bool,
+    now: i64,
+    max_bytes: u64,
+    /// Details panel open: no Category column.
+    compact: bool,
+}
+
+/// What the user did in a table row, applied after the table is drawn.
+#[derive(Debug)]
+enum RowAction {
+    Select(String, bool),
+    ToggleIgnore(String),
+    Reveal(PathBuf),
+    Details(String),
+}
+
+/// Confirmation dialogs (one at a time).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dialog {
+    ConfirmClean,
+    EmptyTrash,
+}
+
+/// What the user did in the details panel.
+#[derive(Debug)]
+enum DetailsAction {
+    Close,
+    Row(RowAction),
+    Breakdown(PathBuf),
+}
+
+/// "Largest folders" state of the details panel, keyed by finding id.
+#[derive(Debug)]
+enum Breakdown {
+    None,
+    Loading(String),
+    Ready(String, Vec<(PathBuf, u64)>),
+}
+
+/// What cleaning `f` does, in the current delete mode.
+fn action_description(f: &Finding, mode: DeleteMode) -> String {
+    match &f.action {
+        None => "Information only; diskdust does not clean it.".to_owned(),
+        Some(CleanupAction::Run(cmd)) => format!("Runs `{}`.", cmd.argv().join(" ")),
+        Some(CleanupAction::EmptyDir { .. }) => "Permanently removes everything inside.".to_owned(),
+        Some(CleanupAction::RemovePath { .. }) if f.privilege == Privilege::Admin => {
+            "Removed permanently with administrator rights.".to_owned()
+        }
+        Some(CleanupAction::RemovePath { .. }) => match mode {
+            DeleteMode::Trash => "Moved to the Trash.".to_owned(),
+            DeleteMode::Permanent => "Deleted permanently.".to_owned(),
+        },
+    }
+}
+
+fn file_name_of(path: &std::path::Path) -> String {
+    path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
 }
 
 /// Item count and reclaimable size of a group of findings. Informational findings are counted
@@ -753,19 +1267,27 @@ fn category_row(ui: &mut egui::Ui, current: &mut Option<Category>, value: Option
     }
 }
 
-fn item_cell(ui: &mut egui::Ui, f: &Finding, home: &std::path::Path) {
-    ui.vertical(|ui| {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(&f.title).strong());
+/// Title and path of a row. Both the title (keyboard / accessibility) and the whole cell (pointer)
+/// are clickable; the returned response covers both.
+fn item_cell(ui: &mut egui::Ui, f: &Finding, home: &std::path::Path, ignored: bool) -> egui::Response {
+    let inner = ui.vertical(|ui| {
+        let title = ui.horizontal(|ui| {
+            let title = ui.add(egui::Label::new(RichText::new(&f.title).strong()).sense(Sense::click()));
+            if ignored {
+                ui.label(RichText::new("ignored").small().color(INFO));
+            }
             if f.privilege == Privilege::Admin {
                 ui.label(RichText::new(format!("{ICON_LOCK} admin")).small().color(ADMIN))
                     .on_hover_text("Requires your administrator password when cleaned");
             }
+            title
         });
         let second =
             f.path.as_ref().map_or_else(|| f.detail.clone(), |p| format!("{} — {}", display_path(p, home), f.detail));
         ui.label(RichText::new(second).small().weak()).on_hover_text(&f.detail);
+        title.inner
     });
+    inner.response.interact(Sense::click()) | inner.inner
 }
 
 fn risk_cell(ui: &mut egui::Ui, f: &Finding) {
@@ -844,6 +1366,8 @@ mod tests {
             privilege: Privilege::User,
             action: Some(CleanupAction::RemovePath { path: "/a/b".into(), root: "/a".into() }),
             specificity: 0,
+            last_modified: None,
+            quit_first: None,
         };
         assert!(!removed_permanently_in_trash_mode(&f));
         f.privilege = Privilege::Admin;
@@ -864,7 +1388,36 @@ mod tests {
         let docs = vec![PathBuf::from("/Users/a/Documents"), PathBuf::from("/Users/a/code")];
         assert!(privacy_prompt_note(Os::MacOs, home, &docs).expect("note").contains("your Documents folder"));
         assert!(privacy_prompt_note(Os::Linux, home, &docs).is_none());
-        assert!(privacy_prompt_note(Os::MacOs, home, &[PathBuf::from("/Users/a/code")]).is_none());
+        let only_code = privacy_prompt_note(Os::MacOs, home, &[PathBuf::from("/Users/a/code")]).expect("note");
+        assert!(only_code.contains("Downloads") && !only_code.contains("Documents"));
+    }
+
+    #[test]
+    fn action_descriptions() {
+        let mut f = Finding {
+            id: "x".into(),
+            scanner: "t".into(),
+            category: Category::Trash,
+            title: "x".into(),
+            detail: String::new(),
+            path: None,
+            bytes: None,
+            risk: Risk::Safe,
+            privilege: Privilege::User,
+            action: None,
+            specificity: 0,
+            last_modified: None,
+            quit_first: None,
+        };
+        assert!(action_description(&f, DeleteMode::Trash).starts_with("Information only"));
+        f.action = Some(CleanupAction::Run(diskdust_core::model::KnownCommand::BrewCleanup));
+        assert_eq!(action_description(&f, DeleteMode::Trash), "Runs `brew cleanup --prune=all`.");
+        f.action = Some(CleanupAction::RemovePath { path: "/a/b".into(), root: "/a".into() });
+        assert_eq!(action_description(&f, DeleteMode::Trash), "Moved to the Trash.");
+        assert_eq!(action_description(&f, DeleteMode::Permanent), "Deleted permanently.");
+        f.privilege = Privilege::Admin;
+        assert!(action_description(&f, DeleteMode::Trash).contains("administrator"));
+        assert_eq!(file_name_of(Path::new("/x/y")), "y");
     }
 
     #[test]
@@ -883,9 +1436,9 @@ mod tests {
 
         fn harness(home: &Path) -> Harness<'static, DiskdustApp> {
             let home = home.to_path_buf();
-            Harness::builder()
-                .with_size(vec2(1200.0, 760.0))
-                .build_eframe(move |cc| DiskdustApp::new(cc, Os::current().expect("supported os"), home))
+            Harness::builder().with_size(vec2(1200.0, 760.0)).build_eframe(move |cc| {
+                DiskdustApp::new(cc, Os::current().expect("supported os"), home, SettingsStore::in_memory())
+            })
         }
 
         fn finding(id: &str, title: &str, bytes: Option<u64>, risk: Risk, privilege: Privilege) -> Finding {
@@ -901,6 +1454,8 @@ mod tests {
                 privilege,
                 action: Some(CleanupAction::Run(KnownCommand::BrewCleanup)),
                 specificity: SPECIFIC,
+                last_modified: None,
+                quit_first: None,
             }
         }
 
@@ -994,11 +1549,197 @@ mod tests {
             harness.get_by_label_contains("2 items are marked Review");
             harness.get_by_label_contains("1 item needs administrator access");
             harness.get_by_label_contains("2 items are removed permanently, not moved to the Trash");
+            assert!(harness.query_by_label_contains("first. Items of apps").is_none(), "no app to quit");
             save(&mut harness, "confirm");
             harness.get_by_label("Cancel").click();
             harness.run();
-            assert!(!harness.state().confirm_open);
+            assert!(harness.state().dialog.is_none());
             assert_eq!(harness.state().findings.len(), 5, "cancel must not remove anything");
+        }
+
+        #[test]
+        fn age_filter_hides_recent_and_undated_items() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let mut harness = harness(home.path());
+            let now = format::now_unix();
+            let mut findings = sample();
+            findings[2].last_modified = Some(now - 40 * 86_400); // gobuild: 40 days
+            findings[3].last_modified = Some(now - 86_400); // brew: yesterday
+            harness.state_mut().findings = findings;
+            harness.state_mut().phase = Phase::Idle;
+            harness.run();
+            harness.get_by_label("40 days ago");
+            harness.get_by_label("1 day ago");
+            harness.state_mut().older_than = Some(30);
+            harness.run();
+            let visible: Vec<String> =
+                harness.state().visible().iter().map(|i| harness.state().findings[*i].id.clone()).collect();
+            assert_eq!(visible, ["gobuild"], "recent and undated items are hidden");
+            save(&mut harness, "age-filter");
+        }
+
+        #[test]
+        fn ignored_items_are_hidden_from_results_totals_and_selection() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let mut harness = harness(home.path());
+            harness.state_mut().findings = sample();
+            harness.state_mut().phase = Phase::Idle;
+            harness.state_mut().selected = ["images".to_owned()].into();
+            harness.state_mut().toggle_ignored("images");
+            harness.run();
+            assert!(harness.state().selected.is_empty(), "ignoring deselects");
+            assert!(harness.query_by_label("Unused Docker images").is_none());
+            harness.get_by_label("4 items · 20.6 GB+ reclaimable");
+            harness.get_by_label("Select all").click();
+            harness.run();
+            assert!(!harness.state().selected.contains("images"));
+            harness.get_by_label("Show ignored (1)").click();
+            harness.run();
+            harness.get_by_label("Unused Docker images");
+            harness.get_by_label("ignored");
+            harness.state_mut().toggle_ignored("images");
+            assert!(harness.state().ignored.is_empty());
+        }
+
+        #[test]
+        fn settings_are_loaded_and_saved_on_change() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let code = home.path().join("code");
+            std::fs::create_dir_all(&code).expect("mkdir");
+            let path = home.path().join("config/settings.json");
+            let store = SettingsStore::at(path.clone());
+            store
+                .save(&Settings {
+                    project_roots: Some(vec![code.clone()]),
+                    mode: Some(DeleteMode::Permanent),
+                    older_than: Some(90),
+                    ignored: ["x".to_owned()].into(),
+                })
+                .expect("seed");
+            let home_path = home.path().to_path_buf();
+            let mut harness = Harness::builder()
+                .with_size(vec2(1200.0, 760.0))
+                .build_eframe(move |cc| DiskdustApp::new(cc, Os::current().expect("os"), home_path, store));
+            harness.run();
+            let state = harness.state();
+            assert_eq!(state.mode, DeleteMode::Permanent);
+            assert_eq!(state.older_than, Some(90));
+            assert_eq!(state.project_roots, vec![code.canonicalize().expect("canonical")]);
+            assert!(state.ignored.contains("x"));
+            harness.get_by_label("Move to Trash").click();
+            harness.run();
+            let saved = SettingsStore::at(path).load();
+            assert_eq!(saved.mode, Some(DeleteMode::Trash));
+            assert_eq!(saved.older_than, Some(90));
+        }
+
+        #[test]
+        fn details_panel_shows_item_and_largest_folders() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let home_path = home.path().canonicalize().expect("canonical");
+            let dir = home_path.join("cache/big");
+            for (name, len) in [("alpha", 300_000usize), ("beta", 10_000)] {
+                std::fs::create_dir_all(dir.join(name)).expect("mkdir");
+                std::fs::write(dir.join(name).join("f"), vec![0u8; len]).expect("write");
+            }
+            let mut item = finding("big", "Big cache", Some(310_000), Risk::Safe, Privilege::User);
+            item.path = Some(dir.clone());
+            item.action = Some(CleanupAction::RemovePath { path: dir, root: home_path.join("cache") });
+            let mut harness = harness(&home_path);
+            harness.state_mut().findings = vec![item];
+            harness.state_mut().phase = Phase::Idle;
+            harness.run();
+            harness.get_by_label("Big cache").click();
+            harness.run();
+            assert_eq!(harness.state().details.as_deref(), Some("big"));
+            harness.get_by_label("Moved to the Trash.");
+            harness.get_by_label("Largest folders").click();
+            for _ in 0..200 {
+                harness.step();
+                if matches!(harness.state().breakdown, Breakdown::Ready(..)) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            harness.run();
+            harness.get_by_label("alpha");
+            harness.get_by_label("beta");
+            save(&mut harness, "details");
+            harness.get_by_label("Close").click();
+            harness.run();
+            assert!(harness.state().details.is_none());
+        }
+
+        #[test]
+        fn free_space_and_history_window() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let home_path = home.path().canonicalize().expect("canonical");
+            let os = Os::current().expect("os");
+            let entry = diskdust_core::audit::AuditEntry {
+                timestamp: "2026-11-22T10:30:00Z".into(),
+                run_id: "r".into(),
+                finding_id: "go".into(),
+                title: "Go build cache".into(),
+                path: None,
+                bytes: Some(18_800_000_000),
+                action: CleanupAction::Run(KnownCommand::GoCleanBuildCache),
+                mode: DeleteMode::Trash,
+                elevated: false,
+                ok: true,
+                message: "Done".into(),
+            };
+            crate::session::default_audit_log(os, &home_path).append(&entry).expect("seed audit");
+            let mut harness = harness(&home_path);
+            harness.run();
+            assert!(harness.state().disk.is_some());
+            harness.get_by_label_contains(" free of ");
+            harness.get_by_label("History").click();
+            harness.run();
+            harness.get_by_label("Go build cache");
+            harness.get_by_label("2026-11-22 10:30");
+            save(&mut harness, "history");
+        }
+
+        #[test]
+        fn empty_trash_after_trash_mode_clean() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let home_path = home.path().canonicalize().expect("canonical");
+            let trash = match Os::current().expect("os") {
+                Os::MacOs => home_path.join(".Trash"),
+                Os::Linux => home_path.join(".local/share/Trash"),
+            };
+            std::fs::create_dir_all(trash.join("files")).expect("mkdir");
+            std::fs::write(trash.join("files/old.bin"), vec![0u8; 2 * 1024 * 1024]).expect("write");
+            let mut harness = harness(&home_path);
+            harness.state_mut().phase = Phase::Idle;
+            harness.state_mut().offer_empty_trash = true;
+            harness.run();
+            harness.get_by_label("Empty Trash…").click();
+            harness.run();
+            harness.get_by_label("Empty the Trash?");
+            harness.get_by_label("Empty Trash").click();
+            wait_until_idle(&mut harness);
+            assert_eq!(std::fs::read_dir(&trash).expect("trash").count(), 0, "emptied");
+            assert!(trash.is_dir(), "the Trash folder itself stays");
+            assert!(!harness.state().offer_empty_trash);
+            assert!(harness.state().status.starts_with("Cleaned 1 item, freed"), "{}", harness.state().status);
+        }
+
+        #[test]
+        fn full_disk_access_banner_can_be_dismissed() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let mut harness = harness(home.path());
+            harness.state_mut().full_disk_access = Some(false);
+            harness.run();
+            harness.get_by_label_contains("without Full Disk Access");
+            harness.get_by_label("Open Privacy settings");
+            save(&mut harness, "full-disk-access");
+            harness.get_by_label("Dismiss").click();
+            harness.run();
+            assert!(harness.query_by_label_contains("without Full Disk Access").is_none());
+            harness.state_mut().full_disk_access = Some(true);
+            harness.run();
+            assert!(harness.query_by_label_contains("without Full Disk Access").is_none());
         }
 
         #[test]

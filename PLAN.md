@@ -33,7 +33,9 @@ diskdust/                     (Cargo workspace)
 │   ├── scan.rs               scan orchestration, progress events, overlap dedupe
 │   ├── scanners/             path rules table + Docker, Homebrew, Go, Trash, Time Machine,
 │   │                         journald, apt/dnf/dnf5/pacman, snap, orphaned app data,
-│   │                         build artifacts
+│   │                         build artifacts, old toolchains, installers, Lima/Colima disks
+│   ├── disk.rs               free/total space (statvfs)
+│   ├── access.rs             macOS Full Disk Access probe
 │   ├── clean.rs              executor (trash / permanent / known commands)
 │   ├── audit.rs              JSONL deletion log
 │   └── privilege.rs          helper payload encoding + elevation command construction
@@ -136,7 +138,9 @@ Remaining manual checks (need an interactive session on macOS):
    `system_trash_moves_a_real_file` (see `REMEDIATION_PLAN.md` B5).
 2. An admin clean (e.g. `/Library/Logs/DiagnosticReports`) to exercise the macOS password prompt.
 
-Review findings and their remediation are tracked in [`REMEDIATION_PLAN.md`](REMEDIATION_PLAN.md).
+Review findings, their remediation and the follow-up features (age filter, persisted settings,
+toolchains, installers, VM disks, running-app guard, `diskdust clean`, details panel, history,
+Full Disk Access guidance) are tracked in [`REMEDIATION_PLAN.md`](REMEDIATION_PLAN.md).
 
 ### 9.1 Iteration 2 (2026-11-22, after first real use)
 

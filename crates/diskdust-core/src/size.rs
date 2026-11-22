@@ -32,11 +32,15 @@ pub struct SizeReport {
     pub skipped: u64,
     /// False when the walk was cut short by cancellation, so the figures are partial.
     pub complete: bool,
+    /// Newest modification time of any file or folder inside (Unix seconds). Folder times
+    /// matter: npm stores package files with a fixed 1985 timestamp, but the folders show when
+    /// they were installed.
+    pub newest: Option<i64>,
 }
 
 impl Default for SizeReport {
     fn default() -> Self {
-        Self { bytes: 0, shared: 0, files: 0, skipped: 0, complete: true }
+        Self { bytes: 0, shared: 0, files: 0, skipped: 0, complete: true, newest: None }
     }
 }
 
@@ -50,6 +54,7 @@ impl Add for SizeReport {
             files: self.files + rhs.files,
             skipped: self.skipped + rhs.skipped,
             complete: self.complete && rhs.complete,
+            newest: self.newest.max(rhs.newest),
         }
     }
 }
@@ -78,6 +83,27 @@ pub fn measure(path: &Path, cancel: &AtomicBool) -> SizeReport {
     })
 }
 
+/// The `limit` largest direct children of `dir` by reclaimable bytes, largest first. Symlinks are
+/// skipped; a cancelled walk returns what was fully measured.
+pub fn largest_children(dir: &Path, cancel: &AtomicBool, limit: usize) -> Vec<(std::path::PathBuf, u64)> {
+    let Ok(read) = fs::read_dir(dir) else { return Vec::new() };
+    let entries: Vec<std::path::PathBuf> = read
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_ok_and(|t| !t.is_symlink()))
+        .map(|e| e.path())
+        .collect();
+    let mut sized: Vec<(std::path::PathBuf, u64)> = entries
+        .into_par_iter()
+        .filter_map(|path| {
+            let report = measure(&path, cancel);
+            report.complete.then_some((path, report.bytes))
+        })
+        .collect();
+    sized.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    sized.truncate(limit);
+    sized
+}
+
 /// A hard-linked inode met during the walk.
 struct Inode {
     nlink: u64,
@@ -100,10 +126,10 @@ impl Walker<'_> {
             if meta.dev() != self.device {
                 return SizeReport::default();
             }
-            let own = SizeReport { bytes: allocated_bytes(meta), ..SizeReport::default() };
+            let own = SizeReport { bytes: allocated_bytes(meta), newest: Some(meta.mtime()), ..SizeReport::default() };
             own + self.children(path)
         } else {
-            self.file(meta)
+            SizeReport { newest: Some(meta.mtime()), ..self.file(meta) }
         }
     }
 
@@ -170,6 +196,40 @@ mod tests {
         assert_eq!(report.files, 2);
         assert!(report.bytes >= 150_000, "{report:?}");
         assert_eq!(report.skipped, 0);
+    }
+
+    #[test]
+    fn newest_modification_time_includes_folders() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pkg = dir.path().join("node_modules/pkg");
+        fs::create_dir_all(&pkg).expect("mkdir");
+        let file = pkg.join("index.js");
+        fs::write(&file, b"x").expect("write");
+        // npm writes package files with a fixed old timestamp.
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_mins(8_319_375);
+        fs::File::options().write(true).open(&file).expect("open").set_modified(old).expect("mtime");
+        let report = measure(&dir.path().join("node_modules"), &not_cancelled());
+        let folder = fs::metadata(&pkg).expect("meta").mtime();
+        assert_eq!(report.newest, Some(folder));
+        assert!(folder > 499_162_500);
+        assert_eq!(measure(Path::new("/definitely/not/here"), &not_cancelled()).newest, None);
+    }
+
+    #[test]
+    fn largest_children_sorted_and_limited() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, len) in [("small", 10_000usize), ("big", 300_000), ("mid", 100_000)] {
+            fs::create_dir(dir.path().join(name)).expect("mkdir");
+            fs::write(dir.path().join(name).join("f"), vec![1u8; len]).expect("write");
+        }
+        symlink(dir.path().join("big"), dir.path().join("link")).expect("symlink");
+        let top = largest_children(dir.path(), &not_cancelled(), 2);
+        let names: Vec<_> =
+            top.iter().map(|(p, _)| p.file_name().expect("name").to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["big", "mid"]);
+        assert!(top[0].1 >= 300_000);
+        assert!(largest_children(&dir.path().join("big/f"), &not_cancelled(), 5).is_empty(), "files have no children");
+        assert!(largest_children(dir.path(), &AtomicBool::new(true), 5).iter().all(|(p, _)| !p.is_dir()));
     }
 
     #[test]
@@ -258,8 +318,11 @@ mod tests {
 
     #[test]
     fn add_saturates_and_propagates_partial() {
-        let a = SizeReport { bytes: u64::MAX, shared: 1, files: 1, skipped: 0, complete: true };
-        let b = SizeReport { bytes: 10, shared: u64::MAX, files: 2, skipped: 3, complete: false };
-        assert_eq!(a + b, SizeReport { bytes: u64::MAX, shared: u64::MAX, files: 3, skipped: 3, complete: false });
+        let a = SizeReport { bytes: u64::MAX, shared: 1, files: 1, skipped: 0, complete: true, newest: Some(5) };
+        let b = SizeReport { bytes: 10, shared: u64::MAX, files: 2, skipped: 3, complete: false, newest: None };
+        assert_eq!(
+            a + b,
+            SizeReport { bytes: u64::MAX, shared: u64::MAX, files: 3, skipped: 3, complete: false, newest: Some(5) }
+        );
     }
 }

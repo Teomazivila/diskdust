@@ -5,9 +5,11 @@
 //! - [`clean::Cleaner`] executes cleanup actions after re-validating them with [`safety`].
 //! - [`privilege`] implements the privileged helper protocol for admin-only items.
 
+pub mod access;
 pub mod audit;
 pub mod clean;
 pub mod command;
+pub mod disk;
 pub mod model;
 pub mod privilege;
 pub mod safety;

@@ -1,8 +1,8 @@
 # diskdust
 
-A native desktop app (and read-only CLI) that finds **non-obvious reclaimable disk space** on macOS
-and Linux — container data, `~/Library`, developer caches, build artifacts, system caches — shows it
-grouped by category and size, and reclaims it safely.
+A native desktop app (and CLI) that finds **non-obvious reclaimable disk space** on macOS and Linux —
+container data, `~/Library`, developer caches, old toolchains, build artifacts, installers, system
+caches — shows it grouped by category, size and age, and reclaims it safely.
 
 Written in Rust (`eframe`/`egui`), one binary, no runtime dependencies.
 
@@ -10,14 +10,16 @@ Written in Rust (`eframe`/`egui`), one binary, no runtime dependencies.
 
 | Category | macOS | Linux |
 |---|---|---|
-| Containers | Unused Docker images, stopped containers, unused volumes, build cache (`docker system df`); `Docker.raw` (info) | same |
+| Containers | Unused Docker images, stopped containers, unused volumes, build cache (`docker system df`); `Docker.raw`, Lima / Colima VM disks (info) | same (Lima / Colima where installed) |
 | App caches | `~/Library/Caches/*`, Slack / VS Code / Cursor / Discord / Chrome caches | `~/.cache/*`, Slack / VS Code / Discord / Chrome under `~/.config` |
 | Logs | `~/Library/Logs/*`, `/Library/Logs/*` 🔒 | systemd journal (`journalctl --vacuum-time=7d`) 🔒 |
 | Developer caches | Cargo, npm, pnpm, Yarn, Bun, pip, uv, Gradle, Maven, Helm, Deno, Playwright, CocoaPods, JetBrains, Terraform, minikube, Hugging Face, Ollama, Homebrew (`brew cleanup`), Go (`go clean`) | same (XDG paths) |
+| Old toolchains | rustup toolchains other than default/active, nvm / fnm Node versions other than the default, pyenv versions other than the global one, older JetBrains IDE settings, Android system images | same |
 | Build artifacts | `target/`, `node_modules/`, `.next/`, `.terraform/`, `.venv/`, Gradle `build/` and `.gradle/` under your project folders | same |
+| Installers | `Install macOS *.app`; `.dmg` / `.pkg` / `.iso` in Downloads untouched for 30+ days | `.iso` / `.deb` / `.rpm` / `.AppImage` in Downloads, 30+ days |
 | Xcode | DerivedData, Archives, device support, simulator caches, unavailable simulators | — |
 | Device backups | iPhone/iPad backups | — |
-| Orphaned app data | `~/Library/Application Support/<bundle-id>` with no installed app | — |
+| Orphaned app data | `Application Support`, `Saved Application State`, `HTTPStorages`, `WebKit` folders of bundle ids with no installed app | — |
 | Trash | `~/.Trash` | `~/.local/share/Trash` |
 | System 🔒 | `/Library/Caches/*`, Time Machine local snapshots | APT, DNF, DNF5, pacman caches; disabled snap revisions |
 
@@ -29,7 +31,21 @@ disk image), are marked **Info**.
 
 Sizes are **allocated** bytes (real disk usage). Files hard-linked from elsewhere — e.g. a
 `node_modules` installed by pnpm — are not counted as reclaimable, because removing one link does
-not free them; the item says how much is shared.
+not free them; the item says how much is shared. Every measured item shows when anything inside it
+was last modified.
+
+## In the app
+
+- **Filter** by category, name/path, and age (*Untouched 7 / 30 / 90 / 180+ days*).
+- **Details panel** (click a row): what cleaning does, the full explanation, and *Largest folders*
+  inside the item.
+- **Ignore** items for good (row context menu or details panel); *Show ignored* brings them back.
+- **Running-app guard**: Slack, VS Code, Cursor, Discord, Chrome caches and Xcode DerivedData are
+  skipped while the app runs; the confirmation dialog says which apps to quit.
+- **Free space** of your home volume in the toolbar, **Empty Trash** after a Trash-mode clean, and a
+  **History** of past cleanups (from the audit log).
+- Project folders, delete mode, age filter and ignored items are saved in `settings.json`
+  (`~/Library/Application Support/diskdust/` on macOS, `$XDG_CONFIG_HOME/diskdust/` on Linux).
 
 ## Safety model
 
@@ -41,7 +57,8 @@ not free them; the item says how much is shared.
   absolute, exist, not be a symlink, lie strictly inside its declared root after resolving
   symlinks, and must not be (or contain) a protected location (`/`, `$HOME`, `/System`, `/usr`,
   `~/Documents`, `~/.ssh`, …). Walks never follow symlinks or cross file systems.
-- **No arbitrary commands.** External tools run from a closed list of fixed argument vectors.
+- **No arbitrary commands.** External tools run from a closed list of fixed argument vectors;
+  arguments derived from scanned data (snap names, rustup toolchain names) are validated.
 - **The GUI never runs as root.** Admin items are passed (hex-encoded, typed) to
   `diskdust helper`, launched through the OS prompt (`osascript … with administrator privileges`
   on macOS, `pkexec` on Linux). The helper ignores the folders sent by the app, re-validates every
@@ -54,18 +71,31 @@ not free them; the item says how much is shared.
 ## Usage
 
 ```sh
-diskdust               # open the desktop app
-diskdust scan          # read-only report in the terminal
-diskdust scan --json   # same, as JSON
+diskdust                                   # open the desktop app
+diskdust scan [filters] [--json]           # read-only report in the terminal
+diskdust clean [filters] --dry-run         # list what would be cleaned
+diskdust clean [filters] --yes [--permanent] [--json]
+```
+
+Filters: `--category <name>` (repeatable: `containers`, `developer-caches`, `old-toolchains`,
+`build-artifacts`, `installers`, `app-caches`, `logs`, `xcode`, `device-backups`,
+`orphaned-app-data`, `trash`, `system`), `--safe-only`, `--older-than <days>`.
+
+`diskdust clean` follows the same safety rules as the app: Trash by default, ignored items are never
+touched, running apps block their caches, every attempt is audited, and admin items are skipped
+(clean those from the app). It exits with status 1 when any item was not cleaned. Example:
+
+```sh
+diskdust clean --category build-artifacts --older-than 90 --safe-only --dry-run
 ```
 
 ### macOS privacy prompts
 
 diskdust searches common project folders (`~/Documents`, `~/code`, `~/Projects`, …) for build
-output. Because `~/Documents` is protected, macOS asks once whether diskdust may access it; remove
-the folder under **Project folders** to skip it. The Trash and some app data are unreadable without
-*Full Disk Access*; diskdust then reports their size as unknown and, for the Trash, asks Finder to
-empty it.
+output and `~/Downloads` for old installers. Because these folders are protected, macOS asks once
+whether diskdust may access them; remove a folder under **Project folders** to skip it. The Trash and
+some app data are unreadable without *Full Disk Access*: the app shows a banner with a shortcut to
+the setting, reports those sizes as unknown and, for the Trash, asks Finder to empty it.
 
 ## Build from source
 
@@ -93,8 +123,10 @@ macOS bundles are ad-hoc signed; sign with a Developer ID and notarize before di
 ## Development
 
 ```
-crates/diskdust-core   engine: scanners, size walker, safety, cleaner, audit log, privilege helper
-crates/diskdust        binary: egui UI, background workers, CLI, `helper` subcommand
+crates/diskdust-core   engine: scanners, size walker, safety, cleaner, audit log, privilege helper,
+                       disk space and macOS access probes
+crates/diskdust        binary: egui UI, background workers, shared clean session, settings, CLI,
+                       `helper` subcommand
 ```
 
 Quality gates (all run in CI on macOS and Linux, `.github/workflows/ci.yml`):

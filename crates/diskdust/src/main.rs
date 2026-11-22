@@ -1,13 +1,16 @@
 //! diskdust: find and reclaim hidden disk space on macOS and Linux.
 //!
 //! - `diskdust` opens the desktop app.
-//! - `diskdust scan [--json]` prints a read-only report in the terminal.
+//! - `diskdust scan [filters] [--json]` prints a read-only report in the terminal.
+//! - `diskdust clean [filters] (--dry-run | --yes)` cleans matching items without the window.
 //! - `diskdust helper <payload>` is the privileged helper the app launches through the OS
 //!   authorization prompt; it is not meant to be run by hand.
 
 mod app;
 mod cli;
 mod format;
+mod session;
+mod settings;
 mod worker;
 
 use std::process::ExitCode;
@@ -21,9 +24,6 @@ use diskdust_core::privilege::{self, HELPER_SUBCOMMAND};
 /// Window/taskbar icon (the installers use the same artwork from `assets/`).
 const APP_ICON: &[u8] = include_bytes!("../../../assets/icon-256.png");
 
-const USAGE: &str =
-    "usage:\n  diskdust              open the desktop app\n  diskdust scan [--json] print a read-only report";
-
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some(HELPER_SUBCOMMAND) {
@@ -32,12 +32,13 @@ fn main() -> ExitCode {
     init_tracing();
     let result = match args.get(1).map(String::as_str) {
         None => run_gui(),
-        Some("scan") => cli::scan(args.iter().any(|a| a == "--json")),
+        Some("scan") => cli::scan(&args[2..]),
+        Some("clean") => cli::clean(&args[2..]),
         Some("-h" | "--help") => {
-            println!("{USAGE}");
+            println!("{}", cli::USAGE);
             Ok(())
         }
-        Some(other) => Err(anyhow::anyhow!("unknown command `{other}`\n\n{USAGE}")),
+        Some(other) => Err(anyhow::anyhow!("unknown command `{other}`\n\n{}", cli::USAGE)),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -86,8 +87,14 @@ fn run_gui() -> anyhow::Result<()> {
         Err(e) => tracing::warn!(error = %e, "could not decode the window icon"),
     }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
-    eframe::run_native("diskdust", options, Box::new(move |cc| Ok(Box::new(app::DiskdustApp::new(cc, os, home)))))
-        .map_err(|e| anyhow::anyhow!("failed to open the window: {e}"))
+    eframe::run_native(
+        "diskdust",
+        options,
+        Box::new(move |cc| {
+            Ok(Box::new(app::DiskdustApp::new(cc, os, home, settings::SettingsStore::default_location())))
+        }),
+    )
+    .map_err(|e| anyhow::anyhow!("failed to open the window: {e}"))
 }
 
 #[cfg(test)]

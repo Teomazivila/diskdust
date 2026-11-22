@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::command::{CommandError, CommandRunner};
-use crate::model::{CleanupAction, KnownCommand};
+use crate::model::{CleanupAction, Finding, KnownCommand, RunningApp};
 use crate::safety::{SafetyError, SafetyPolicy};
 
 /// Prune commands on large Docker installs can take a while.
@@ -162,6 +162,24 @@ impl Cleaner<'_> {
         let summary = out.stdout.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("Done");
         Ok(tail(summary, 200))
     }
+}
+
+/// Whether `app` is running, according to `pgrep`. `false` when `pgrep` is unavailable.
+pub fn is_running(runner: &dyn CommandRunner, app: &RunningApp) -> bool {
+    let argv: Vec<String> = std::iter::once("pgrep".to_owned()).chain(app.pgrep.iter().cloned()).collect();
+    match runner.run(&argv, Duration::from_secs(5)) {
+        Ok(out) => out.success,
+        Err(e) => {
+            tracing::warn!(error = %e, app = %app.app, "could not check whether the app is running");
+            false
+        }
+    }
+}
+
+/// Reason to skip `finding` because the app owning its data is running, if any.
+pub fn quit_first_reason(runner: &dyn CommandRunner, finding: &Finding) -> Option<String> {
+    let app = finding.quit_first.as_ref()?;
+    is_running(runner, app).then(|| format!("{} is running. Quit it, then clean again.", app.app))
 }
 
 /// Last `max` characters of `text`, trimmed.
@@ -408,6 +426,22 @@ pub(crate) mod tests {
         fs::write(&file, b"diskdust Trash verification; safe to delete").expect("write");
         SystemTrash.trash(&file).expect("moved to Trash");
         assert!(!file.exists(), "file must leave its folder");
+    }
+
+    #[test]
+    fn running_apps_block_their_items() {
+        let slack = RunningApp { app: "Slack".into(), pgrep: vec!["-f".into(), "Slack.app/Contents/MacOS/".into()] };
+        let mut finding = crate::scanners::testutil::sample_finding();
+        assert_eq!(quit_first_reason(&FakeRunner::new(), &finding), None, "no app attached");
+        finding.quit_first = Some(slack.clone());
+        let running = FakeRunner::new().respond("pgrep -f Slack.app/Contents/MacOS/", true, "123\n");
+        assert_eq!(
+            quit_first_reason(&running, &finding).as_deref(),
+            Some("Slack is running. Quit it, then clean again.")
+        );
+        let stopped = FakeRunner::new().respond("pgrep -f Slack.app/Contents/MacOS/", false, "");
+        assert!(quit_first_reason(&stopped, &finding).is_none());
+        assert!(!is_running(&FakeRunner::new(), &slack), "missing pgrep never blocks");
     }
 
     #[test]

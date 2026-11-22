@@ -31,6 +31,25 @@ pub fn items_are(n: usize) -> String {
     if n == 1 { "1 item is".to_owned() } else { format!("{n} items are") }
 }
 
+/// "today", "1 day ago", "12 days ago", "3 months ago", "2 years ago", "—" (unknown).
+pub fn age(days: Option<u64>) -> String {
+    match days {
+        None => "—".to_owned(),
+        Some(0) => "today".to_owned(),
+        Some(1) => "1 day ago".to_owned(),
+        Some(d @ 2..=59) => format!("{d} days ago"),
+        Some(d @ 60..=729) => format!("{} months ago", d / 30),
+        Some(d) => format!("{} years ago", d / 365),
+    }
+}
+
+/// Current time in Unix seconds.
+pub fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
 pub fn duration(d: Duration) -> String {
     let secs = d.as_secs_f64();
     if secs < 60.0 { format!("{secs:.1} s") } else { format!("{}m {:02}s", d.as_secs() / 60, d.as_secs() % 60) }
@@ -65,6 +84,17 @@ mod tests {
         assert_eq!(items(0), "0 items");
         assert_eq!(items_are(1), "1 item is");
         assert_eq!(items_are(4), "4 items are");
+    }
+
+    #[test]
+    fn formats_ages() {
+        assert_eq!(age(None), "—");
+        assert_eq!(age(Some(0)), "today");
+        assert_eq!(age(Some(1)), "1 day ago");
+        assert_eq!(age(Some(45)), "45 days ago");
+        assert_eq!(age(Some(95)), "3 months ago");
+        assert_eq!(age(Some(800)), "2 years ago");
+        assert!(now_unix() > 1_700_000_000);
     }
 
     #[test]
