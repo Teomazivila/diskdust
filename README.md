@@ -18,11 +18,30 @@ Download the file for your system from the
 | Debian / Ubuntu | `diskdust_<version>_amd64.deb` / `_arm64.deb` | `sudo apt install ./diskdust_<version>_amd64.deb` |
 | Other Linux | `diskdust_<version>_x86_64.AppImage` / `_aarch64.AppImage` | `chmod +x` it and run it |
 
-The macOS app is signed ad hoc but not notarized yet, so macOS blocks the first launch ("cannot
-verify … is free of malware"). Once per version, either open it, click **Done**, then go to
-**System Settings → Privacy & Security → Open Anyway**; or run
-`xattr -d com.apple.quarantine /Applications/diskdust.app` and open it normally. (Right-click →
-**Open** no longer bypasses this check since macOS 15.)
+The macOS build is signed ad hoc but **not notarized** yet, so Gatekeeper rejects a `.dmg`
+downloaded with a browser: double-clicking it does nothing useful. Remove the download quarantine
+from the disk image first, then install as usual (the app copied out of it is then not blocked):
+
+```sh
+xattr -d com.apple.quarantine ~/Downloads/diskdust_<version>_aarch64.dmg   # or _x64.dmg
+open ~/Downloads/diskdust_<version>_aarch64.dmg                            # drag to Applications
+```
+
+Or install from the terminal (`curl` does not quarantine downloads):
+
+```sh
+cd /tmp
+curl -LO https://github.com/Teomazivila/diskdust/releases/latest/download/SHA256SUMS
+curl -LO https://github.com/Teomazivila/diskdust/releases/download/v<version>/diskdust_<version>_aarch64.dmg
+shasum -a 256 -c SHA256SUMS --ignore-missing
+hdiutil attach -nobrowse diskdust_<version>_aarch64.dmg
+ditto /Volumes/diskdust/diskdust.app /Applications/diskdust.app
+hdiutil detach /Volumes/diskdust
+```
+
+If an already-installed copy is blocked on launch, use **System Settings → Privacy & Security →
+Open Anyway** or `xattr -d com.apple.quarantine /Applications/diskdust.app`. (Right-click → **Open**
+no longer bypasses Gatekeeper since macOS 15.)
 
 Each release lists `SHA256SUMS` and carries signed build provenance:
 `sha256sum -c SHA256SUMS --ignore-missing` and
