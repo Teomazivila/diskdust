@@ -76,6 +76,17 @@ impl Category {
     }
 }
 
+impl Category {
+    /// Command-line name: the label in lowercase with dashes (`developer-caches`).
+    pub fn slug(self) -> String {
+        self.label().to_ascii_lowercase().replace(' ', "-")
+    }
+
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.slug() == slug)
+    }
+}
+
 impl fmt::Display for Category {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.label())
@@ -290,6 +301,11 @@ mod tests {
         labels.dedup();
         assert_eq!(labels.len(), Category::ALL.len());
         assert_eq!(Category::Xcode.to_string(), "Xcode");
+        assert_eq!(Category::DeveloperCaches.slug(), "developer-caches");
+        for c in Category::ALL {
+            assert_eq!(Category::from_slug(&c.slug()), Some(c));
+        }
+        assert_eq!(Category::from_slug("nope"), None);
     }
 
     #[test]
