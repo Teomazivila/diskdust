@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to release, without the leading v (must equal the workspace version in Cargo.toml)"
+        description: "Version to release, e.g. 0.1.0 or v0.1.0 (must equal the workspace version in Cargo.toml)"
         required: true
         type: string
   pull_request:
@@ -33,16 +33,20 @@ jobs:
     name: verify release request
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Check branch, version, tag and CI status
+        id: check
         env:
-          VERSION: ${{ inputs.version }}
+          INPUT_VERSION: ${{ inputs.version }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          VERSION="${INPUT_VERSION#v}" # accept 0.1.0 and v0.1.0
           if [ "$GITHUB_REF" != "refs/heads/main" ]; then
             echo "::error::Releases are published from main only (got $GITHUB_REF)"; exit 1
           fi
@@ -61,6 +65,7 @@ jobs:
           if [ "$ci" -lt 1 ]; then
             echo "::error::CI has not passed on $GITHUB_SHA; wait for it or fix main first"; exit 1
           fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
   build:
     name: package (${{ matrix.name }})
@@ -135,7 +140,7 @@ jobs:
           subject-path: dist/*
       - name: Create tag and release
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ needs.verify.outputs.version }}
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
