@@ -6,6 +6,29 @@ caches — shows it grouped by category, size and age, and reclaims it safely.
 
 Written in Rust (`eframe`/`egui`), one binary, no runtime dependencies.
 
+## Install
+
+Download the file for your system from the
+[latest release](https://github.com/Teomazivila/diskdust/releases/latest):
+
+| System | File | How |
+|---|---|---|
+| macOS, Apple Silicon | `diskdust_<version>_aarch64.dmg` | Open it and drag **diskdust** to Applications |
+| macOS, Intel | `diskdust_<version>_x64.dmg` | same |
+| Debian / Ubuntu | `diskdust_<version>_amd64.deb` / `_arm64.deb` | `sudo apt install ./diskdust_<version>_amd64.deb` |
+| Other Linux | `diskdust_<version>_x86_64.AppImage` / `_aarch64.AppImage` | `chmod +x` it and run it |
+
+The macOS app is signed ad hoc but not notarized yet, so the first launch says it "cannot be
+verified": right-click the app → **Open** (once), or run
+`xattr -d com.apple.quarantine /Applications/diskdust.app`.
+
+Each release lists `SHA256SUMS` and carries signed build provenance:
+`sha256sum -c SHA256SUMS --ignore-missing` and
+`gh attestation verify <file> --repo Teomazivila/diskdust`.
+
+For the terminal commands on macOS, link the binary onto your `PATH`, e.g.
+`ln -s /Applications/diskdust.app/Contents/MacOS/diskdust ~/.local/bin/diskdust`.
+
 ## What it finds
 
 | Category | macOS | Linux |
@@ -119,6 +142,20 @@ Built with [`cargo-packager`](https://github.com/crabnebula-dev/cargo-packager) 
 | Linux | `cargo packager --release --formats deb,appimage` | `diskdust_<ver>_amd64.deb`, `diskdust_<ver>_x86_64.AppImage` |
 
 macOS bundles are ad-hoc signed; sign with a Developer ID and notarize before distributing them.
+
+### Publishing a release
+
+Releases are built and published by CI (`.github/workflows/release.yml`); tags are never created by
+hand.
+
+1. Bump `version` in the workspace `Cargo.toml` in a PR and merge it.
+2. Actions → **Release** → *Run workflow* on `main` with that version.
+
+The workflow checks that the version matches `Cargo.toml`, that the tag does not exist and that CI
+passed on the commit; builds the `.dmg` (macOS arm64 and Intel) and `.deb` / `.AppImage` (Linux
+x86_64 and arm64) on native runners; then creates the `v<version>` tag and the GitHub Release with
+`SHA256SUMS` and build provenance. Pull requests that touch packaging run the same builds as a dry
+run.
 
 ## Development
 
