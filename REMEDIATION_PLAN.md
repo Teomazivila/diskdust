@@ -53,17 +53,17 @@
 
 | ID | Feature | Scope | Status |
 |---|---|---|---|
-| F1 | **Age filter** | Walker records the newest modification time; findings carry `last_modified`; table column "Last modified"; filter *Any / 7 / 30 / 90 / 180 days*; CLI `--older-than` | PR 2 |
-| F2 | **Persisted settings** | `settings.json` (macOS `~/Library/Application Support/diskdust`, Linux `$XDG_CONFIG_HOME/diskdust`): project folders, delete mode, age filter, ignored items; per-row *Ignore*, *Show ignored* toggle | PR 2 |
-| F3 | **Old developer toolchains** | rustup toolchains other than default/active (`rustup toolchain uninstall`), nvm and fnm Node versions other than the default, pyenv versions other than the global one, older JetBrains IDE config folders, Android system images and AVDs — all `Review` | PR 2 |
-| F4 | **Installers** | `/Applications/Install macOS *.app`; `.dmg`/`.pkg`/`.iso` in `~/Downloads` older than 30 days (`Review`) | PR 2 |
-| F5 | **VM disks (info)** | Lima (`~/.lima/<vm>/{disk,diffdisk,basedisk}`, `_disks`) and Colima (`~/.colima/_lima/...`) shown as informational items with guidance | PR 2 |
-| F6 | **Running-app guard** | Findings carry the process that must not be running (Slack, Chrome, VS Code, Cursor, Discord, Xcode); the cleaner refuses them while it runs (`pgrep -x`) | PR 2 |
-| F7 | **CLI clean** | `diskdust clean [--dry-run] [--safe-only] [--category C] [--older-than N] [--permanent] [--yes] [--json]`; admin items are listed but skipped | PR 2 |
-| F8 | **Details & drill-down** | Selecting a row opens a details panel; "Largest folders" measures children in the background | PR 2 |
-| F9 | **Free space, Empty Trash, History** | Free/total disk space in the toolbar (refreshed after cleans); *Empty Trash* action after a Trash-mode clean; History window reading the audit log | PR 2 |
-| F10 | **More orphan locations** | `Saved Application State`, `HTTPStorages`, `WebKit` per bundle id | PR 2 |
-| F11 | **Full Disk Access guidance** | Detects missing FDA on macOS; banner with a button opening the Privacy pane | PR 2 |
+| F1 | **Age filter** | Walker records the newest modification time; findings carry `last_modified`; table column "Last modified"; filter *Any / 7 / 30 / 90 / 180 days*; CLI `--older-than` | ✅ Done (`db80aa3`) |
+| F2 | **Persisted settings** | `settings.json` (macOS `~/Library/Application Support/diskdust`, Linux `$XDG_CONFIG_HOME/diskdust`): project folders, delete mode, age filter, ignored items; per-row *Ignore*, *Show ignored* toggle | ✅ Done (`9f2e3ff`) |
+| F3 | **Old developer toolchains** | rustup toolchains other than default/active (`rustup toolchain uninstall`), nvm and fnm Node versions other than the default, pyenv versions other than the global one, older JetBrains IDE config folders, Android system images and AVDs — all `Review` | ✅ Done (`76d8a9a`) |
+| F4 | **Installers** | `/Applications/Install macOS *.app`; `.dmg`/`.pkg`/`.iso` in `~/Downloads` older than 30 days (`Review`) | ✅ Done (`2e73731`) |
+| F5 | **VM disks (info)** | Lima (`~/.lima/<vm>/{disk,diffdisk,basedisk}`, `_disks`) and Colima (`~/.colima/_lima/...`) shown as informational items with guidance | ✅ Done (`2e73731`) |
+| F6 | **Running-app guard** | Findings carry the process that must not be running (Slack, Chrome, VS Code, Cursor, Discord, Xcode); the cleaner refuses them while it runs (`pgrep -f` on macOS, `pgrep -x` on Linux; Linux process names not verified on a desktop) | ✅ Done (`d8273f8`) |
+| F7 | **CLI clean** | `diskdust clean [--dry-run] [--safe-only] [--category C] [--older-than N] [--permanent] [--yes] [--json]`; admin items are listed but skipped | ✅ Done (`6892bbf`) |
+| F8 | **Details & drill-down** | Selecting a row opens a details panel; "Largest folders" measures children in the background | ✅ Done (`021ad48, 52294be`) |
+| F9 | **Free space, Empty Trash, History** | Free/total disk space in the toolbar (refreshed after cleans); *Empty Trash* action after a Trash-mode clean; History window reading the audit log | ✅ Done (`d5bf755, 52294be`) |
+| F10 | **More orphan locations** | `Saved Application State`, `HTTPStorages`, `WebKit` per bundle id | ✅ Done (`bc835a0`) |
+| F11 | **Full Disk Access guidance** | Detects missing FDA on macOS; banner with a button opening the Privacy pane | ✅ Done (`50ebb1b`) |
 
 ### Deferred (with reason)
 
