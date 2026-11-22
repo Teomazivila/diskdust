@@ -1,4 +1,5 @@
-//! `~/Library/Application Support/<bundle-id>` folders left behind by uninstalled apps (macOS).
+//! Per-app folders left behind by uninstalled apps (macOS): `~/Library/Application Support`,
+//! `Saved Application State`, `HTTPStorages` and `WebKit`, keyed by bundle id.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -10,6 +11,14 @@ use crate::model::{Category, CleanupAction, Finding, Os, Risk, SPECIFIC};
 
 #[derive(Debug)]
 pub struct OrphanedAppDataScanner;
+
+/// `(folder under ~/Library, suffix after the bundle id, what it holds)`.
+const LOCATIONS: [(&str, &str, &str); 4] = [
+    ("Library/Application Support", "", "App data"),
+    ("Library/Saved Application State", ".savedState", "Saved window state"),
+    ("Library/HTTPStorages", "", "Cookies and HTTP cache"),
+    ("Library/WebKit", "", "Web content data"),
+];
 
 /// Reverse-DNS names such as `com.vendor.app`: at least three dot-separated segments.
 fn looks_like_bundle_id(name: &str) -> bool {
@@ -61,34 +70,49 @@ impl Scanner for OrphanedAppDataScanner {
     }
 
     fn scan(&self, ctx: &ScanContext<'_>) -> Result<Vec<Finding>, ScanError> {
-        let support = ctx.home.join("Library/Application Support");
         let installed = installed_bundle_ids(&ctx.app_dirs);
         if installed.is_empty() {
             // Without a list of installed apps everything would look orphaned; report nothing.
             return Ok(Vec::new());
         }
-        Ok(children(&support)
+        Ok(LOCATIONS
             .par_iter()
-            .filter(|p| is_real_dir(p))
-            .filter_map(|dir| {
-                let name = file_name(dir);
-                if !looks_like_bundle_id(&name) || name.starts_with("com.apple.") || is_installed(&name, &installed) {
-                    return None;
-                }
-                let report = ctx.measure(dir)?;
-                let bytes = report.bytes;
-                (bytes >= MIN_BYTES).then(|| Finding {
-                    last_modified: report.newest,
-                    detail: "App data with no matching installed app. The app may live outside /Applications; \
-                             check before removing."
-                        .to_owned(),
-                    path: Some(dir.clone()),
-                    bytes: Some(bytes),
-                    risk: Risk::Review,
-                    action: Some(CleanupAction::RemovePath { path: dir.clone(), root: support.clone() }),
-                    specificity: SPECIFIC,
-                    ..base_finding("orphans", format!("orphans:{}", dir.display()), Category::OrphanedAppData, name)
-                })
+            .flat_map(|(rel, suffix, what)| {
+                let root = ctx.home.join(rel);
+                children(&root)
+                    .par_iter()
+                    .filter(|p| is_real_dir(p))
+                    .filter_map(|dir| {
+                        let name = file_name(dir);
+                        let id = name.strip_suffix(suffix)?;
+                        if !looks_like_bundle_id(id) || id.starts_with("com.apple.") || is_installed(id, &installed) {
+                            return None;
+                        }
+                        let report = ctx.measure(dir)?;
+                        (report.bytes >= MIN_BYTES).then(|| Finding {
+                            last_modified: report.newest,
+                            detail: format!(
+                                "{what} with no matching installed app. The app may live outside /Applications; \
+                                 check before removing."
+                            ),
+                            path: Some(dir.clone()),
+                            bytes: Some(report.bytes),
+                            risk: Risk::Review,
+                            action: Some(CleanupAction::RemovePath { path: dir.clone(), root: root.clone() }),
+                            specificity: SPECIFIC,
+                            ..base_finding(
+                                "orphans",
+                                format!("orphans:{}", dir.display()),
+                                Category::OrphanedAppData,
+                                if suffix.is_empty() && *rel == "Library/Application Support" {
+                                    id.to_owned()
+                                } else {
+                                    format!("{id} · {what}")
+                                },
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect())
     }
@@ -146,6 +170,33 @@ mod tests {
         let titles: Vec<_> = found.iter().map(|f| f.title.as_str()).collect();
         assert_eq!(titles, ["com.gone.app"]);
         assert_eq!(found[0].risk, Risk::Review);
+    }
+
+    #[test]
+    fn other_library_locations_are_checked() {
+        let env = Env::new();
+        install_app(&env, "Applications/Kept.app", "com.kept.app");
+        env.file("Library/Saved Application State/com.gone.app.savedState/data.data", BIG);
+        env.file("Library/Saved Application State/com.kept.app.savedState/data.data", BIG);
+        env.file("Library/HTTPStorages/com.gone.app/httpstorages.sqlite", BIG);
+        env.file("Library/WebKit/com.gone.app/WebsiteData/x", BIG);
+        env.file("Library/WebKit/Databases/x", BIG);
+        let runner = FakeRunner::new();
+        let mut titles: Vec<_> = OrphanedAppDataScanner
+            .scan(&env.ctx(Os::MacOs, &runner))
+            .expect("scan")
+            .into_iter()
+            .map(|f| f.title)
+            .collect();
+        titles.sort();
+        assert_eq!(
+            titles,
+            [
+                "com.gone.app · Cookies and HTTP cache",
+                "com.gone.app · Saved window state",
+                "com.gone.app · Web content data"
+            ]
+        );
     }
 
     #[test]
