@@ -38,13 +38,17 @@ pub enum Category {
     OrphanedAppData,
     Trash,
     System,
+    Toolchains,
+    Installers,
 }
 
 impl Category {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::Containers,
         Self::DeveloperCaches,
+        Self::Toolchains,
         Self::BuildArtifacts,
+        Self::Installers,
         Self::AppCaches,
         Self::Logs,
         Self::Xcode,
@@ -66,6 +70,8 @@ impl Category {
             Self::OrphanedAppData => "Orphaned app data",
             Self::Trash => "Trash",
             Self::System => "System",
+            Self::Toolchains => "Old toolchains",
+            Self::Installers => "Installers",
         }
     }
 }
@@ -111,6 +117,7 @@ pub enum KnownCommand {
     DnfClean,
     PacmanClean,
     SnapRemoveRevision { name: String, revision: String },
+    RustupUninstall { toolchain: String },
 }
 
 impl KnownCommand {
@@ -133,6 +140,9 @@ impl KnownCommand {
             Self::PacmanClean => &["pacman", "-Sc", "--noconfirm"],
             Self::SnapRemoveRevision { name, revision } => {
                 return vec!["snap".to_owned(), "remove".to_owned(), name.clone(), format!("--revision={revision}")];
+            }
+            Self::RustupUninstall { toolchain } => {
+                return vec!["rustup".to_owned(), "toolchain".to_owned(), "uninstall".to_owned(), toolchain.clone()];
             }
         };
         fixed.iter().map(|s| (*s).to_owned()).collect()
@@ -168,9 +178,18 @@ impl KnownCommand {
             Self::SnapRemoveRevision { name, revision } => {
                 is_snap_name(name) && !revision.is_empty() && revision.bytes().all(|b| b.is_ascii_digit())
             }
+            Self::RustupUninstall { toolchain } => is_toolchain_name(toolchain),
             _ => true,
         }
     }
+}
+
+/// rustup toolchain names such as `1.94.0-aarch64-apple-darwin` or `nightly-2026-01-01-x86_64-unknown-linux-gnu`.
+fn is_toolchain_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 100
+        && !name.starts_with('-')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
 }
 
 fn is_snap_name(name: &str) -> bool {
@@ -293,6 +312,16 @@ mod tests {
         {
             let cmd = KnownCommand::SnapRemoveRevision { name: name.into(), revision: rev.into() };
             assert!(!cmd.is_well_formed(), "{name:?} {rev:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn rustup_uninstall_is_validated() {
+        let ok = KnownCommand::RustupUninstall { toolchain: "1.94.0-aarch64-apple-darwin".into() };
+        assert_eq!(ok.argv(), ["rustup", "toolchain", "uninstall", "1.94.0-aarch64-apple-darwin"]);
+        assert!(ok.is_well_formed() && !ok.requires_admin());
+        for bad in ["", "--all", "stable; rm -rf ~", "a b", "../x"] {
+            assert!(!KnownCommand::RustupUninstall { toolchain: bad.into() }.is_well_formed(), "{bad:?}");
         }
     }
 

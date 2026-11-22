@@ -4,6 +4,7 @@ mod artifacts;
 mod docker;
 mod orphans;
 mod paths;
+mod toolchains;
 mod tools;
 mod trash;
 
@@ -21,6 +22,7 @@ pub use artifacts::BuildArtifactsScanner;
 pub use docker::DockerScanner;
 pub use orphans::OrphanedAppDataScanner;
 pub use paths::{Base, Mode, PathRule, PathRulesScanner, default_rules, resolved_rule_paths};
+pub use toolchains::ToolchainsScanner;
 pub use tools::{GoScanner, HomebrewScanner, JournalScanner, SimulatorScanner, SnapScanner, TimeMachineScanner};
 pub use trash::TrashScanner;
 
@@ -146,6 +148,7 @@ pub fn default_scanners() -> Vec<Box<dyn Scanner>> {
         Box::new(TrashScanner),
         Box::new(OrphanedAppDataScanner),
         Box::new(BuildArtifactsScanner),
+        Box::new(ToolchainsScanner),
         Box::new(TimeMachineScanner),
         Box::new(JournalScanner),
         Box::new(SnapScanner),
