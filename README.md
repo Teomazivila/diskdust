@@ -31,7 +31,7 @@ Or install from the terminal (`curl` does not quarantine downloads):
 
 ```sh
 cd /tmp
-curl -LO https://github.com/Teomazivila/diskdust/releases/latest/download/SHA256SUMS
+curl -LO https://github.com/Teomazivila/diskdust/releases/download/v<version>/SHA256SUMS
 curl -LO https://github.com/Teomazivila/diskdust/releases/download/v<version>/diskdust_<version>_aarch64.dmg
 shasum -a 256 -c SHA256SUMS --ignore-missing
 hdiutil attach -nobrowse diskdust_<version>_aarch64.dmg
