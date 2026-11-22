@@ -1,11 +1,14 @@
 //! Scanners that ask an installed tool where its data lives.
 
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use super::{MIN_BYTES, ScanContext, ScanError, Scanner, base_finding, is_real_dir, with_shared_note};
 use crate::model::{Category, CleanupAction, Finding, KnownCommand, Os, Privilege, Risk, SPECIFIC};
-use crate::units::parse_journal_usage;
+use crate::units::{format_bytes, parse_journal_usage};
+
+/// Age passed to `journalctl --vacuum-time` (keep in sync with [`KnownCommand::JournalVacuum`]).
+const JOURNAL_KEEP: Duration = Duration::from_hours(7 * 24);
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -241,12 +244,26 @@ impl Scanner for JournalScanner {
         let Some(out) = query(ctx, &["journalctl", "--disk-usage"])? else {
             return Ok(Vec::new());
         };
-        let Some(bytes) = parse_journal_usage(&out).filter(|b| *b >= MIN_BYTES) else {
+        let Some(total) = parse_journal_usage(&out).filter(|b| *b >= MIN_BYTES) else {
             return Ok(Vec::new());
         };
+        let cutoff = SystemTime::now().checked_sub(JOURNAL_KEEP).unwrap_or(SystemTime::UNIX_EPOCH);
+        let estimate = vacuumable_journal_bytes(&ctx.system_path("/var/log/journal"), cutoff);
+        if estimate.is_some_and(|b| b < MIN_BYTES) {
+            return Ok(Vec::new());
+        }
+        let size_note = match estimate {
+            Some(_) => {
+                format!("Estimate: archived journal files older than 7 days, of {} in total.", format_bytes(total))
+            }
+            None => format!(
+                "The journal uses {} in total; how much is older than 7 days cannot be read without administrator access.",
+                format_bytes(total)
+            ),
+        };
         Ok(vec![Finding {
-            detail: "System logs. Vacuumed to the last 7 days with `journalctl --vacuum-time=7d`.".to_owned(),
-            bytes: Some(bytes),
+            detail: format!("System logs. Vacuumed to the last 7 days with `journalctl --vacuum-time=7d`. {size_note}"),
+            bytes: estimate,
             risk: Risk::Safe,
             privilege: Privilege::Admin,
             action: Some(CleanupAction::Run(KnownCommand::JournalVacuum)),
@@ -254,6 +271,31 @@ impl Scanner for JournalScanner {
             ..base_finding("journald", "journald:usage".to_owned(), Category::Logs, "systemd journal".to_owned())
         }])
     }
+}
+
+/// Allocated bytes of archived journal files (`name@….journal` / `….journal~`) last written before
+/// `cutoff` — what `journalctl --vacuum-time` removes. `None` when the journal is unreadable.
+fn vacuumable_journal_bytes(journal_dir: &Path, cutoff: SystemTime) -> Option<u64> {
+    let machines = match std::fs::read_dir(journal_dir) {
+        Ok(read) => read,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(0),
+        Err(_) => return None,
+    };
+    let mut total = 0u64;
+    for machine in machines.filter_map(Result::ok) {
+        if !machine.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        for file in std::fs::read_dir(machine.path()).ok()?.filter_map(Result::ok) {
+            let name = file.file_name().to_string_lossy().into_owned();
+            let archived = (name.contains('@') && name.ends_with(".journal")) || name.ends_with(".journal~");
+            let Ok(meta) = file.metadata() else { continue };
+            if archived && meta.is_file() && meta.modified().is_ok_and(|m| m < cutoff) {
+                total = total.saturating_add(crate::size::allocated_bytes(&meta));
+            }
+        }
+    }
+    Some(total)
 }
 
 /// Disabled (superseded) snap revisions (Linux, admin).
@@ -316,6 +358,7 @@ mod tests {
     use super::*;
     use crate::command::fake::FakeRunner;
     use crate::scanners::testutil::{BIG, Env};
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn homebrew_cache_measured() {
@@ -407,17 +450,55 @@ mod tests {
         assert!(TimeMachineScanner.scan(&env.ctx(Os::MacOs, &none)).expect("scan").is_empty());
     }
 
+    fn age(path: &Path, days: u64) {
+        let file = std::fs::File::options().write(true).open(path).expect("open");
+        file.set_modified(SystemTime::now() - Duration::from_hours(days * 24)).expect("set mtime");
+    }
+
     #[test]
-    fn journal_usage_reported() {
+    fn journal_estimate_counts_only_old_archived_files() {
         let env = Env::new();
+        let dir = "var/log/journal/0123abcd";
+        let old = env.sys_file(&format!("{dir}/system@0001-0002-0003.journal"), BIG);
+        let corrupt = env.sys_file(&format!("{dir}/user-1000@0004.journal~"), BIG);
+        let recent = env.sys_file(&format!("{dir}/user-1000@0005-0006.journal"), BIG);
+        let active = env.sys_file(&format!("{dir}/system.journal"), BIG);
+        for p in [&old, &corrupt, &active] {
+            age(p, 30);
+        }
+        age(&recent, 2);
         let runner = FakeRunner::new().respond(
             "journalctl --disk-usage",
             true,
             "Archived and active journals take up 1.5G in the file system.\n",
         );
         let found = JournalScanner.scan(&env.ctx(Os::Linux, &runner)).expect("scan");
-        assert_eq!(found[0].bytes, Some(1_610_612_736));
+        let bytes = found[0].bytes.expect("estimate");
+        assert!(bytes >= 2 * BIG as u64 && bytes < 3 * BIG as u64, "only the two old archived files: {bytes}");
+        assert!(found[0].detail.contains("of 1.6 GB in total"), "{}", found[0].detail);
         assert_eq!(found[0].action, Some(CleanupAction::Run(KnownCommand::JournalVacuum)));
+    }
+
+    #[test]
+    fn journal_without_old_files_or_unreadable() {
+        let env = Env::new();
+        let runner = FakeRunner::new().respond(
+            "journalctl --disk-usage",
+            true,
+            "Archived and active journals take up 1.5G in the file system.\n",
+        );
+        // Volatile journal only (no /var/log/journal): nothing older to vacuum.
+        assert!(JournalScanner.scan(&env.ctx(Os::Linux, &runner)).expect("scan").is_empty());
+        let dir = env.system.join("var/log/journal");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let found = JournalScanner.scan(&env.ctx(Os::Linux, &runner)).expect("scan");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod back");
+        // Root ignores permission bits (CI containers); only assert when the read was refused.
+        if let Some(f) = found.first() {
+            assert_eq!(f.bytes, None);
+            assert!(f.detail.contains("cannot be read without administrator access"));
+        }
         let small =
             FakeRunner::new().respond("journalctl --disk-usage", true, "Journals take up 8.0K in the file system.");
         assert!(JournalScanner.scan(&env.ctx(Os::Linux, &small)).expect("scan").is_empty());
