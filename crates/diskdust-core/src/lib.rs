@@ -8,6 +8,7 @@
 pub mod audit;
 pub mod clean;
 pub mod command;
+pub mod disk;
 pub mod model;
 pub mod privilege;
 pub mod safety;

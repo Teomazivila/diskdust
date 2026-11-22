@@ -10,6 +10,8 @@ publish.workspace = true
 [dependencies]
 plist.workspace = true
 rayon.workspace = true
+# statvfs for free/total disk space (safe wrapper; already in the dependency tree via winit).
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

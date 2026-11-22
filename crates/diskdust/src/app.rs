@@ -26,6 +26,8 @@ const ADMIN: Color32 = Color32::from_rgb(100, 181, 246);
 const DANGER: Color32 = Color32::from_rgb(229, 115, 115);
 const ACCENT: Color32 = Color32::from_rgb(126, 87, 194);
 const MAX_ACTIVITY: usize = 300;
+/// Entries shown in the History window.
+const HISTORY_LIMIT: usize = 300;
 /// Choices of the "last modified" filter, in days (`None` = any age).
 const AGE_FILTERS: [Option<u32>; 5] = [None, Some(7), Some(30), Some(90), Some(180)];
 
@@ -97,13 +99,20 @@ pub struct DiskdustApp {
     /// Finding shown in the details panel.
     details: Option<String>,
     breakdown: Breakdown,
+    /// Free / total space of the home volume.
+    disk: Option<diskdust_core::disk::DiskSpace>,
+    /// Offer "Empty Trash" after a clean moved items there.
+    offer_empty_trash: bool,
+    /// Entries shown in the History window, when open.
+    history: Option<Vec<diskdust_core::audit::AuditEntry>>,
     mode: DeleteMode,
     project_roots: Vec<PathBuf>,
     phase: Phase,
     cancel: Arc<AtomicBool>,
     notifier: Notifier,
     rx: Receiver<Msg>,
-    confirm_open: bool,
+    /// Open confirmation dialog, if any.
+    dialog: Option<Dialog>,
     activity: Vec<Activity>,
     status: String,
     tally: CleanTally,
@@ -134,13 +143,102 @@ impl DiskdustApp {
             cancel: Arc::new(AtomicBool::new(false)),
             notifier: Notifier::new(tx, cc.egui_ctx.clone()),
             rx,
-            confirm_open: false,
+            dialog: None,
             activity: Vec::new(),
             status: "Ready. Scanning only reads; nothing is removed until you confirm.".to_owned(),
             tally: CleanTally::default(),
             saved,
             details: None,
             breakdown: Breakdown::None,
+            disk: None,
+            offer_empty_trash: false,
+            history: None,
+        }
+        .with_disk_space()
+    }
+
+    fn with_disk_space(mut self) -> Self {
+        self.refresh_disk();
+        self
+    }
+
+    fn refresh_disk(&mut self) {
+        self.disk = diskdust_core::disk::space(&self.home);
+    }
+
+    fn open_history(&mut self) {
+        let log = crate::session::default_audit_log(self.os, &self.home);
+        match log.read_recent(HISTORY_LIMIT) {
+            Ok(entries) => self.history = Some(entries),
+            Err(e) => self.log(false, format!("Could not read {}: {e}", log.path().display())),
+        }
+    }
+
+    fn start_empty_trash(&mut self) {
+        self.offer_empty_trash = false;
+        self.tally = CleanTally::default();
+        self.phase = Phase::Cleaning { total: 1, done: 0 };
+        "Emptying the Trash…".clone_into(&mut self.status);
+        worker::spawn_empty_trash(self.os, self.home.clone(), self.notifier.clone());
+    }
+
+    fn history_window(&mut self, ctx: &egui::Context) {
+        let Some(entries) = &self.history else { return };
+        let mut open = true;
+        egui::Window::new("Cleanup history").open(&mut open).default_size(vec2(720.0, 420.0)).show(ctx, |ui| {
+            if entries.is_empty() {
+                ui.label(RichText::new("Nothing has been cleaned yet.").weak());
+                return;
+            }
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::Grid::new("history-grid").striped(true).num_columns(4).spacing(vec2(12.0, 4.0)).show(ui, |ui| {
+                    for e in entries {
+                        ui.label(
+                            RichText::new(e.timestamp.get(..16).unwrap_or(&e.timestamp).replace('T', " ")).small(),
+                        );
+                        let (icon, color) = if e.ok { (ICON_OK, SAFE) } else { (ICON_FAIL, DANGER) };
+                        ui.label(RichText::new(icon).color(color));
+                        ui.label(&e.title).on_hover_text(&e.message);
+                        ui.label(RichText::new(format::maybe_bytes(e.bytes)).small());
+                        ui.end_row();
+                    }
+                });
+            });
+        });
+        if !open {
+            self.history = None;
+        }
+    }
+
+    fn empty_trash_modal(&mut self, ctx: &egui::Context) {
+        let mut confirmed = false;
+        let mut cancelled = false;
+        let modal = egui::Modal::new(egui::Id::unique("empty-trash")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.heading("Empty the Trash?");
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(
+                    "Everything in the Trash is deleted permanently, including items you moved there before. \
+                     This cannot be undone.",
+                )
+                .color(DANGER),
+            );
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new(RichText::new("Empty Trash").strong()).fill(DANGER)).clicked() {
+                    confirmed = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancelled = true;
+                }
+            });
+        });
+        if confirmed {
+            self.dialog = None;
+            self.start_empty_trash();
+        } else if cancelled || modal.should_close() {
+            self.dialog = None;
         }
     }
 
@@ -359,6 +457,7 @@ impl DiskdustApp {
                         format::bytes(total)
                     );
                     self.phase = Phase::Idle;
+                    self.refresh_disk();
                 }
                 Msg::Cleaned(result) => self.on_cleaned(&result),
                 Msg::Breakdown { id, entries } => {
@@ -369,6 +468,11 @@ impl DiskdustApp {
                 Msg::CleanDone => {
                     self.status = clean_summary(&self.tally);
                     self.phase = Phase::Idle;
+                    self.offer_empty_trash = self.tally.trashed > 0;
+                    self.refresh_disk();
+                    if self.history.is_some() {
+                        self.open_history();
+                    }
                 }
             }
         }
@@ -457,6 +561,11 @@ impl DiskdustApp {
         ui.horizontal(|ui| {
             ui.label(RichText::new("diskdust").size(22.0).strong().color(ACCENT));
             ui.label(RichText::new("find and reclaim hidden disk space").weak());
+            if let Some(disk) = self.disk {
+                ui.separator();
+                ui.label(format!("{} free of {}", format::bytes(disk.available), format::bytes(disk.total)))
+                    .on_hover_text("Space available on the volume holding your home folder");
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let (count, bytes) = self.selection_summary();
                 let clean_label = if count == 0 {
@@ -470,7 +579,7 @@ impl DiskdustApp {
                     ui.visuals().widgets.inactive.weak_bg_fill
                 });
                 if ui.add_enabled(count > 0 && !self.busy(), clean).clicked() {
-                    self.confirm_open = true;
+                    self.dialog = Some(Dialog::ConfirmClean);
                 }
                 ui.separator();
                 ui.selectable_value(&mut self.mode, DeleteMode::Permanent, "Delete permanently")
@@ -478,6 +587,9 @@ impl DiskdustApp {
                 ui.selectable_value(&mut self.mode, DeleteMode::Trash, "Move to Trash")
                     .on_hover_text("Recoverable. Space is reclaimed when you empty the Trash.");
                 ui.separator();
+                if ui.button("History").on_hover_text("Previous cleanups (from the audit log)").clicked() {
+                    self.open_history();
+                }
                 if let Phase::Scanning { .. } = self.phase {
                     if ui.button("Cancel scan").clicked() {
                         self.cancel.store(true, Ordering::Relaxed);
@@ -584,6 +696,9 @@ impl DiskdustApp {
             }
             Phase::Idle | Phase::Welcome => {
                 ui.label(&self.status);
+                if self.offer_empty_trash && ui.button("Empty Trash…").clicked() {
+                    self.dialog = Some(Dialog::EmptyTrash);
+                }
             }
         });
         egui::CollapsingHeader::new(format!("Activity ({})", self.activity.len())).id_salt("activity").show(ui, |ui| {
@@ -857,10 +972,10 @@ impl DiskdustApp {
             });
         });
         if confirmed {
-            self.confirm_open = false;
+            self.dialog = None;
             self.start_clean();
         } else if cancelled || modal.should_close() {
-            self.confirm_open = false;
+            self.dialog = None;
         }
     }
 }
@@ -888,10 +1003,13 @@ impl eframe::App for DiskdustApp {
                 self.table(ui);
             }
         });
-        if self.confirm_open {
-            let ctx = ui.ctx().clone();
-            self.confirm_modal(&ctx);
+        let ctx = ui.ctx().clone();
+        match self.dialog {
+            Some(Dialog::ConfirmClean) => self.confirm_modal(&ctx),
+            Some(Dialog::EmptyTrash) => self.empty_trash_modal(&ctx),
+            None => {}
         }
+        self.history_window(&ctx);
         self.persist();
     }
 }
@@ -990,6 +1108,13 @@ enum RowAction {
     ToggleIgnore(String),
     Reveal(PathBuf),
     Details(String),
+}
+
+/// Confirmation dialogs (one at a time).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dialog {
+    ConfirmClean,
+    EmptyTrash,
 }
 
 /// What the user did in the details panel.
@@ -1354,7 +1479,7 @@ mod tests {
             save(&mut harness, "confirm");
             harness.get_by_label("Cancel").click();
             harness.run();
-            assert!(!harness.state().confirm_open);
+            assert!(harness.state().dialog.is_none());
             assert_eq!(harness.state().findings.len(), 5, "cancel must not remove anything");
         }
 
@@ -1469,6 +1594,61 @@ mod tests {
             harness.get_by_label("Close").click();
             harness.run();
             assert!(harness.state().details.is_none());
+        }
+
+        #[test]
+        fn free_space_and_history_window() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let home_path = home.path().canonicalize().expect("canonical");
+            let os = Os::current().expect("os");
+            let entry = diskdust_core::audit::AuditEntry {
+                timestamp: "2026-11-22T10:30:00Z".into(),
+                run_id: "r".into(),
+                finding_id: "go".into(),
+                title: "Go build cache".into(),
+                path: None,
+                bytes: Some(18_800_000_000),
+                action: CleanupAction::Run(KnownCommand::GoCleanBuildCache),
+                mode: DeleteMode::Trash,
+                elevated: false,
+                ok: true,
+                message: "Done".into(),
+            };
+            crate::session::default_audit_log(os, &home_path).append(&entry).expect("seed audit");
+            let mut harness = harness(&home_path);
+            harness.run();
+            assert!(harness.state().disk.is_some());
+            harness.get_by_label_contains(" free of ");
+            harness.get_by_label("History").click();
+            harness.run();
+            harness.get_by_label("Go build cache");
+            harness.get_by_label("2026-11-22 10:30");
+            save(&mut harness, "history");
+        }
+
+        #[test]
+        fn empty_trash_after_trash_mode_clean() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let home_path = home.path().canonicalize().expect("canonical");
+            let trash = match Os::current().expect("os") {
+                Os::MacOs => home_path.join(".Trash"),
+                Os::Linux => home_path.join(".local/share/Trash"),
+            };
+            std::fs::create_dir_all(trash.join("files")).expect("mkdir");
+            std::fs::write(trash.join("files/old.bin"), vec![0u8; 2 * 1024 * 1024]).expect("write");
+            let mut harness = harness(&home_path);
+            harness.state_mut().phase = Phase::Idle;
+            harness.state_mut().offer_empty_trash = true;
+            harness.run();
+            harness.get_by_label("Empty Trash…").click();
+            harness.run();
+            harness.get_by_label("Empty the Trash?");
+            harness.get_by_label("Empty Trash").click();
+            wait_until_idle(&mut harness);
+            assert_eq!(std::fs::read_dir(&trash).expect("trash").count(), 0, "emptied");
+            assert!(trash.is_dir(), "the Trash folder itself stays");
+            assert!(!harness.state().offer_empty_trash);
+            assert!(harness.state().status.starts_with("Cleaned 1 item, freed"), "{}", harness.state().status);
         }
 
         #[test]

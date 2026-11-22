@@ -11,7 +11,7 @@ use diskdust_core::clean::DeleteMode;
 use diskdust_core::command::SystemRunner;
 use diskdust_core::model::{Finding, Os};
 use diskdust_core::scan::{ScanEvent, run_scan};
-use diskdust_core::scanners::{ScanContext, default_app_dirs, default_scanners};
+use diskdust_core::scanners::{ScanContext, Scanner, TrashScanner, default_app_dirs, default_scanners};
 
 pub use crate::session::CleanResult;
 use crate::session::{Elevation, clean_findings, default_audit_log};
@@ -91,6 +91,33 @@ pub fn spawn_breakdown(id: String, path: PathBuf, notifier: Notifier) {
     });
     if let Err(e) = spawned {
         tracing::error!(error = %e, "failed to start breakdown thread");
+    }
+}
+
+/// Empties the user's Trash (everything in it, permanently), reporting like a clean.
+pub fn spawn_empty_trash(os: Os, home: PathBuf, notifier: Notifier) {
+    let spawned = thread::Builder::new().name("diskdust-empty-trash".into()).spawn(move || {
+        let runner = SystemRunner::new(&home);
+        let cancel = AtomicBool::new(false);
+        let ctx = ScanContext {
+            os,
+            home: home.clone(),
+            system_root: PathBuf::from("/"),
+            project_roots: Vec::new(),
+            app_dirs: Vec::new(),
+            runner: &runner,
+            cancel: &cancel,
+        };
+        let scanners: [Box<dyn Scanner>; 1] = [Box::new(TrashScanner)];
+        let findings = run_scan(&ctx, &scanners, &|_| {});
+        let audit = default_audit_log(os, &home);
+        clean_findings(os, &home, &findings, DeleteMode::Permanent, &audit, Elevation::Prompt, &mut |result| {
+            notifier.send(Msg::Cleaned(result));
+        });
+        notifier.send(Msg::CleanDone);
+    });
+    if let Err(e) = spawned {
+        tracing::error!(error = %e, "failed to start empty-trash thread");
     }
 }
 

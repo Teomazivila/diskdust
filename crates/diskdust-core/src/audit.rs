@@ -68,6 +68,17 @@ impl AuditLog {
         &self.path
     }
 
+    /// Up to `limit` most recent entries, newest first. A missing log is empty; malformed lines
+    /// are skipped.
+    pub fn read_recent(&self, limit: usize) -> io::Result<Vec<AuditEntry>> {
+        let text = match fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        Ok(text.lines().rev().filter_map(|l| serde_json::from_str(l).ok()).take(limit).collect())
+    }
+
     pub fn append(&self, entry: &AuditEntry) -> io::Result<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
@@ -123,6 +134,22 @@ mod tests {
         legacy.as_object_mut().expect("object").remove("run_id");
         let parsed: AuditEntry = serde_json::from_value(legacy).expect("legacy entry");
         assert_eq!(parsed.run_id, "");
+    }
+
+    #[test]
+    fn reads_recent_entries_newest_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = AuditLog::new(dir.path().join("cleanup.jsonl"));
+        assert!(log.read_recent(5).expect("missing log").is_empty());
+        for (i, ok) in [true, false, true].into_iter().enumerate() {
+            let mut e = entry(ok);
+            e.finding_id = format!("f{i}");
+            log.append(&e).expect("append");
+        }
+        fs::OpenOptions::new().append(true).open(log.path()).expect("open").write_all(b"not json\n").expect("write");
+        let recent = log.read_recent(2).expect("read");
+        let ids: Vec<_> = recent.iter().map(|e| e.finding_id.as_str()).collect();
+        assert_eq!(ids, ["f2", "f1"]);
     }
 
     #[test]
