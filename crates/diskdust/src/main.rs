@@ -8,6 +8,7 @@
 mod app;
 mod cli;
 mod format;
+mod settings;
 mod worker;
 
 use std::process::ExitCode;
@@ -86,8 +87,14 @@ fn run_gui() -> anyhow::Result<()> {
         Err(e) => tracing::warn!(error = %e, "could not decode the window icon"),
     }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
-    eframe::run_native("diskdust", options, Box::new(move |cc| Ok(Box::new(app::DiskdustApp::new(cc, os, home)))))
-        .map_err(|e| anyhow::anyhow!("failed to open the window: {e}"))
+    eframe::run_native(
+        "diskdust",
+        options,
+        Box::new(move |cc| {
+            Ok(Box::new(app::DiskdustApp::new(cc, os, home, settings::SettingsStore::default_location())))
+        }),
+    )
+    .map_err(|e| anyhow::anyhow!("failed to open the window: {e}"))
 }
 
 #[cfg(test)]

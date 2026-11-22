@@ -16,6 +16,7 @@ use egui::{Align, Color32, Layout, RichText, Sense, vec2};
 use egui_extras::{Column, TableBuilder};
 
 use crate::format;
+use crate::settings::{Settings, SettingsStore};
 use crate::worker::{self, CleanResult, Msg, Notifier};
 
 const SAFE: Color32 = Color32::from_rgb(102, 187, 106);
@@ -85,6 +86,14 @@ pub struct DiskdustApp {
     search: String,
     /// Only show items not modified for at least this many days.
     older_than: Option<u32>,
+    /// Finding ids the user chose to ignore (persisted).
+    ignored: std::collections::BTreeSet<String>,
+    show_ignored: bool,
+    /// True once the user edited the project folders (then they are persisted).
+    roots_customized: bool,
+    store: SettingsStore,
+    /// Last settings written, to save only on change.
+    saved: Settings,
     mode: DeleteMode,
     project_roots: Vec<PathBuf>,
     phase: Phase,
@@ -98,10 +107,12 @@ pub struct DiskdustApp {
 }
 
 impl DiskdustApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, os: Os, home: PathBuf) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, os: Os, home: PathBuf, store: SettingsStore) -> Self {
         configure_style(&cc.egui_ctx);
         let (tx, rx) = channel();
-        let project_roots = default_project_roots(&home);
+        let saved = store.load();
+        let roots_customized = saved.project_roots.is_some();
+        let project_roots = saved.project_roots.clone().map_or_else(|| default_project_roots(&home), unique_dirs);
         Self {
             os,
             home,
@@ -109,8 +120,12 @@ impl DiskdustApp {
             selected: HashSet::new(),
             category: None,
             search: String::new(),
-            older_than: None,
-            mode: DeleteMode::Trash,
+            older_than: saved.older_than,
+            ignored: saved.ignored.clone(),
+            show_ignored: false,
+            roots_customized,
+            store,
+            mode: saved.mode.unwrap_or(DeleteMode::Trash),
             project_roots,
             phase: Phase::Welcome,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -120,6 +135,43 @@ impl DiskdustApp {
             activity: Vec::new(),
             status: "Ready. Scanning only reads; nothing is removed until you confirm.".to_owned(),
             tally: CleanTally::default(),
+            saved,
+        }
+    }
+
+    fn current_settings(&self) -> Settings {
+        Settings {
+            project_roots: self.roots_customized.then(|| self.project_roots.clone()),
+            mode: Some(self.mode),
+            older_than: self.older_than,
+            ignored: self.ignored.clone(),
+        }
+    }
+
+    /// Saves settings when they changed since the last write.
+    fn persist(&mut self) {
+        let current = self.current_settings();
+        let unchanged = current.project_roots == self.saved.project_roots
+            && current.mode.unwrap_or(DeleteMode::Trash) == self.saved.mode.unwrap_or(DeleteMode::Trash)
+            && current.older_than == self.saved.older_than
+            && current.ignored == self.saved.ignored;
+        if unchanged {
+            return;
+        }
+        if let Err(e) = self.store.save(&current) {
+            tracing::warn!(error = %e, "could not save settings");
+        }
+        self.saved = current;
+    }
+
+    fn is_ignored(&self, f: &Finding) -> bool {
+        self.ignored.contains(&f.id)
+    }
+
+    fn toggle_ignored(&mut self, id: &str) {
+        if !self.ignored.remove(id) {
+            self.ignored.insert(id.to_owned());
+            self.selected.remove(id);
         }
     }
 
@@ -230,6 +282,7 @@ impl DiskdustApp {
             .iter()
             .enumerate()
             .filter(|(_, f)| self.category.is_none_or(|c| f.category == c))
+            .filter(|(_, f)| self.show_ignored || !self.is_ignored(f))
             .filter(|(_, f)| {
                 self.older_than.is_none_or(|days| f.age_days(now).is_some_and(|age| age >= u64::from(days)))
             })
@@ -247,7 +300,7 @@ impl DiskdustApp {
     fn select_visible(&mut self, keep: impl Fn(&Finding) -> bool) {
         for i in self.visible() {
             let f = &self.findings[i];
-            if f.is_actionable() && keep(f) {
+            if f.is_actionable() && !self.is_ignored(f) && keep(f) {
                 self.selected.insert(f.id.clone());
             }
         }
@@ -307,7 +360,7 @@ impl DiskdustApp {
         ui.add_space(8.0);
         let mut totals: BTreeMap<Category, Totals> = BTreeMap::new();
         let mut all = Totals::default();
-        for f in &self.findings {
+        for f in self.findings.iter().filter(|f| !self.is_ignored(f)) {
             totals.entry(f.category).or_default().add(f);
             all.add(f);
         }
@@ -361,6 +414,7 @@ impl DiskdustApp {
         }
         if let Some(i) = remove {
             self.project_roots.remove(i);
+            self.roots_customized = true;
         }
         if ui.add_enabled(!self.busy(), egui::Button::new("Add folder…")).clicked()
             && let Some(folder) = rfd::FileDialog::new().set_directory(&self.home).pick_folder()
@@ -368,6 +422,7 @@ impl DiskdustApp {
             let mut roots = self.project_roots.clone();
             roots.push(folder);
             self.project_roots = unique_dirs(roots);
+            self.roots_customized = true;
         }
     }
 
@@ -456,6 +511,10 @@ impl DiskdustApp {
                 shown.add(&self.findings[*i]);
             }
             ui.label(RichText::new(format!("{} · {} reclaimable", format::items(shown.count), shown.label())).weak());
+            let ignored = self.findings.iter().filter(|f| self.is_ignored(f)).count();
+            if ignored > 0 || self.show_ignored {
+                ui.checkbox(&mut self.show_ignored, format!("Show ignored ({ignored})"));
+            }
         });
         ui.add_space(4.0);
     }
@@ -487,7 +546,7 @@ impl DiskdustApp {
         let now = format::now_unix();
         let text_height = ui.text_style_height(&egui::TextStyle::Body);
         let row_height = text_height * 2.0 + 14.0;
-        let mut reveal = None;
+        let mut actions = Vec::new();
         TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
@@ -500,70 +559,82 @@ impl DiskdustApp {
             .column(Column::initial(110.0).at_least(90.0))
             .column(Column::exact(34.0))
             .header(22.0, |mut header| {
-                header.col(|_| {});
-                header.col(|ui| {
-                    ui.strong("Item");
-                });
-                header.col(|ui| {
-                    ui.strong("Category");
-                });
-                header.col(|ui| {
-                    ui.strong("Risk");
-                });
-                header.col(|ui| {
-                    ui.strong("Size");
-                });
-                header.col(|ui| {
-                    ui.strong("Modified");
-                });
-                header.col(|_| {});
+                for title in ["", "Item", "Category", "Risk", "Size", "Modified", ""] {
+                    header.col(|ui| {
+                        ui.strong(title);
+                    });
+                }
             })
             .body(|body| {
-                body.rows(row_height, visible.len(), |mut row| {
+                body.rows(row_height, visible.len(), |row| {
                     let f = &self.findings[visible[row.index()]];
-                    row.col(|ui| {
-                        let mut checked = self.selected.contains(&f.id);
-                        let enabled = f.is_actionable() && !busy;
-                        let response = ui.add_enabled(enabled, egui::Checkbox::without_text(&mut checked));
-                        let label = format!("Select {}", f.title);
-                        response
-                            .widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, checked, &label));
-                        if response.changed() {
-                            if checked {
-                                self.selected.insert(f.id.clone());
-                            } else {
-                                self.selected.remove(&f.id);
-                            }
-                        }
-                    });
-                    row.col(|ui| item_cell(ui, f, &self.home));
-                    row.col(|ui| {
-                        ui.label(f.category.label());
-                    });
-                    row.col(|ui| risk_cell(ui, f));
-                    row.col(|ui| size_cell(ui, f, max_bytes));
-                    row.col(|ui| {
-                        ui.label(RichText::new(format::age(f.age_days(now))).weak());
-                    });
-                    row.col(|ui| {
-                        if let Some(path) = &f.path
-                            && ui.small_button(ICON_REVEAL).on_hover_text("Reveal in file manager").clicked()
-                        {
-                            reveal = Some(path.clone());
-                        }
-                    });
+                    self.table_row(row, f, RowContext { busy, now, max_bytes }, &mut actions);
                 });
             });
-        if let Some(path) = reveal {
-            let target = if path.exists() { path } else { path.parent().map(PathBuf::from).unwrap_or(path) };
-            if let Err(e) = opener::reveal(&target) {
-                self.log(false, format!("Could not reveal {}: {e}", target.display()));
+        for action in actions {
+            self.apply(action);
+        }
+    }
+
+    fn table_row(&self, mut row: egui_extras::TableRow<'_, '_>, f: &Finding, rc: RowContext, out: &mut Vec<RowAction>) {
+        row.col(|ui| {
+            let mut checked = self.selected.contains(&f.id);
+            let enabled = f.is_actionable() && !rc.busy;
+            let response = ui.add_enabled(enabled, egui::Checkbox::without_text(&mut checked));
+            let label = format!("Select {}", f.title);
+            response.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, checked, &label));
+            if response.changed() {
+                out.push(RowAction::Select(f.id.clone(), checked));
+            }
+        });
+        let ignored = self.ignored.contains(&f.id);
+        row.col(|ui| {
+            item_cell(ui, f, &self.home, ignored).context_menu(|ui| {
+                let label = if ignored { "Stop ignoring" } else { "Ignore this item" };
+                if ui.button(label).clicked() {
+                    out.push(RowAction::ToggleIgnore(f.id.clone()));
+                    ui.close();
+                }
+            });
+        });
+        row.col(|ui| {
+            ui.label(f.category.label());
+        });
+        row.col(|ui| risk_cell(ui, f));
+        row.col(|ui| size_cell(ui, f, rc.max_bytes));
+        row.col(|ui| {
+            ui.label(RichText::new(format::age(f.age_days(rc.now))).weak());
+        });
+        row.col(|ui| {
+            if let Some(path) = &f.path
+                && ui.small_button(ICON_REVEAL).on_hover_text("Reveal in file manager").clicked()
+            {
+                out.push(RowAction::Reveal(path.clone()));
+            }
+        });
+    }
+
+    fn apply(&mut self, action: RowAction) {
+        match action {
+            RowAction::Select(id, true) => {
+                self.selected.insert(id);
+            }
+            RowAction::Select(id, false) => {
+                self.selected.remove(&id);
+            }
+            RowAction::ToggleIgnore(id) => self.toggle_ignored(&id),
+            RowAction::Reveal(path) => {
+                let target = if path.exists() { path } else { path.parent().map(PathBuf::from).unwrap_or(path) };
+                if let Err(e) = opener::reveal(&target) {
+                    self.log(false, format!("Could not reveal {}: {e}", target.display()));
+                }
             }
         }
     }
 
     fn confirm_modal(&mut self, ctx: &egui::Context) {
-        let chosen: Vec<&Finding> = self.findings.iter().filter(|f| self.selected.contains(&f.id)).collect();
+        let chosen: Vec<&Finding> =
+            self.findings.iter().filter(|f| self.selected.contains(&f.id) && !self.is_ignored(f)).collect();
         let total: u64 = chosen.iter().map(|f| f.bytes_or_zero()).sum();
         let review = chosen.iter().filter(|f| f.risk == Risk::Review).count();
         let admin = chosen.iter().filter(|f| f.privilege == Privilege::Admin).count();
@@ -660,6 +731,7 @@ impl eframe::App for DiskdustApp {
             let ctx = ui.ctx().clone();
             self.confirm_modal(&ctx);
         }
+        self.persist();
     }
 }
 
@@ -737,6 +809,22 @@ fn visuals() -> egui::Visuals {
     v
 }
 
+/// Per-frame values shared by every table row.
+#[derive(Debug, Clone, Copy)]
+struct RowContext {
+    busy: bool,
+    now: i64,
+    max_bytes: u64,
+}
+
+/// What the user did in a table row, applied after the table is drawn.
+#[derive(Debug)]
+enum RowAction {
+    Select(String, bool),
+    ToggleIgnore(String),
+    Reveal(PathBuf),
+}
+
 /// Item count and reclaimable size of a group of findings. Informational findings are counted
 /// but never contribute bytes, since they cannot be cleaned.
 #[derive(Debug, Default, Clone, Copy)]
@@ -777,10 +865,13 @@ fn category_row(ui: &mut egui::Ui, current: &mut Option<Category>, value: Option
     }
 }
 
-fn item_cell(ui: &mut egui::Ui, f: &Finding, home: &std::path::Path) {
+fn item_cell(ui: &mut egui::Ui, f: &Finding, home: &std::path::Path, ignored: bool) -> egui::Response {
     ui.vertical(|ui| {
         ui.horizontal(|ui| {
             ui.label(RichText::new(&f.title).strong());
+            if ignored {
+                ui.label(RichText::new("ignored").small().color(INFO));
+            }
             if f.privilege == Privilege::Admin {
                 ui.label(RichText::new(format!("{ICON_LOCK} admin")).small().color(ADMIN))
                     .on_hover_text("Requires your administrator password when cleaned");
@@ -789,7 +880,9 @@ fn item_cell(ui: &mut egui::Ui, f: &Finding, home: &std::path::Path) {
         let second =
             f.path.as_ref().map_or_else(|| f.detail.clone(), |p| format!("{} — {}", display_path(p, home), f.detail));
         ui.label(RichText::new(second).small().weak()).on_hover_text(&f.detail);
-    });
+    })
+    .response
+    .interact(Sense::click())
 }
 
 fn risk_cell(ui: &mut egui::Ui, f: &Finding) {
@@ -909,9 +1002,9 @@ mod tests {
 
         fn harness(home: &Path) -> Harness<'static, DiskdustApp> {
             let home = home.to_path_buf();
-            Harness::builder()
-                .with_size(vec2(1200.0, 760.0))
-                .build_eframe(move |cc| DiskdustApp::new(cc, Os::current().expect("supported os"), home))
+            Harness::builder().with_size(vec2(1200.0, 760.0)).build_eframe(move |cc| {
+                DiskdustApp::new(cc, Os::current().expect("supported os"), home, SettingsStore::in_memory())
+            })
         }
 
         fn finding(id: &str, title: &str, bytes: Option<u64>, risk: Risk, privilege: Privilege) -> Finding {
@@ -1048,6 +1141,61 @@ mod tests {
                 harness.state().visible().iter().map(|i| harness.state().findings[*i].id.clone()).collect();
             assert_eq!(visible, ["gobuild"], "recent and undated items are hidden");
             save(&mut harness, "age-filter");
+        }
+
+        #[test]
+        fn ignored_items_are_hidden_from_results_totals_and_selection() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let mut harness = harness(home.path());
+            harness.state_mut().findings = sample();
+            harness.state_mut().phase = Phase::Idle;
+            harness.state_mut().selected = ["images".to_owned()].into();
+            harness.state_mut().toggle_ignored("images");
+            harness.run();
+            assert!(harness.state().selected.is_empty(), "ignoring deselects");
+            assert!(harness.query_by_label("Unused Docker images").is_none());
+            harness.get_by_label("4 items · 20.6 GB+ reclaimable");
+            harness.get_by_label("Select all").click();
+            harness.run();
+            assert!(!harness.state().selected.contains("images"));
+            harness.get_by_label("Show ignored (1)").click();
+            harness.run();
+            harness.get_by_label("Unused Docker images");
+            harness.get_by_label("ignored");
+            harness.state_mut().toggle_ignored("images");
+            assert!(harness.state().ignored.is_empty());
+        }
+
+        #[test]
+        fn settings_are_loaded_and_saved_on_change() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let code = home.path().join("code");
+            std::fs::create_dir_all(&code).expect("mkdir");
+            let path = home.path().join("config/settings.json");
+            let store = SettingsStore::at(path.clone());
+            store
+                .save(&Settings {
+                    project_roots: Some(vec![code.clone()]),
+                    mode: Some(DeleteMode::Permanent),
+                    older_than: Some(90),
+                    ignored: ["x".to_owned()].into(),
+                })
+                .expect("seed");
+            let home_path = home.path().to_path_buf();
+            let mut harness = Harness::builder()
+                .with_size(vec2(1200.0, 760.0))
+                .build_eframe(move |cc| DiskdustApp::new(cc, Os::current().expect("os"), home_path, store));
+            harness.run();
+            let state = harness.state();
+            assert_eq!(state.mode, DeleteMode::Permanent);
+            assert_eq!(state.older_than, Some(90));
+            assert_eq!(state.project_roots, vec![code.canonicalize().expect("canonical")]);
+            assert!(state.ignored.contains("x"));
+            harness.get_by_label("Move to Trash").click();
+            harness.run();
+            let saved = SettingsStore::at(path).load();
+            assert_eq!(saved.mode, Some(DeleteMode::Trash));
+            assert_eq!(saved.older_than, Some(90));
         }
 
         #[test]

@@ -836,6 +836,7 @@ dependencies = [
  "egui_kittest",
  "opener",
  "rfd",
+ "serde",
  "serde_json",
  "tempfile",
  "tracing",
