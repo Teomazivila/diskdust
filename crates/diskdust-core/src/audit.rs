@@ -15,6 +15,9 @@ use crate::model::{CleanupAction, Os};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditEntry {
     pub timestamp: String,
+    /// Identifier shared by every entry of one clean run (empty in logs written before it existed).
+    #[serde(default)]
+    pub run_id: String,
     pub finding_id: String,
     pub title: String,
     pub path: Option<PathBuf>,
@@ -30,6 +33,12 @@ impl AuditEntry {
     /// Current UTC time in RFC 3339.
     pub fn now() -> String {
         OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default()
+    }
+
+    /// New run identifier: UTC nanoseconds and process id in hex, e.g. `18a2f3c4d5e6f708-1f2a`.
+    pub fn new_run_id() -> String {
+        let nanos = OffsetDateTime::now_utc().unix_timestamp_nanos();
+        format!("{nanos:x}-{:x}", std::process::id())
     }
 }
 
@@ -78,6 +87,7 @@ mod tests {
     fn entry(ok: bool) -> AuditEntry {
         AuditEntry {
             timestamp: AuditEntry::now(),
+            run_id: "run-1".into(),
             finding_id: "docker:Build Cache".into(),
             title: "Docker build cache".into(),
             path: None,
@@ -101,6 +111,18 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert!(parsed[0].ok && !parsed[1].ok);
         assert!(parsed[0].timestamp.contains('T'));
+    }
+
+    #[test]
+    fn run_ids_are_unique_and_old_entries_still_parse() {
+        let a = AuditEntry::new_run_id();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert_ne!(a, AuditEntry::new_run_id());
+        assert!(a.contains('-'));
+        let mut legacy = serde_json::to_value(entry(true)).expect("json");
+        legacy.as_object_mut().expect("object").remove("run_id");
+        let parsed: AuditEntry = serde_json::from_value(legacy).expect("legacy entry");
+        assert_eq!(parsed.run_id, "");
     }
 
     #[test]

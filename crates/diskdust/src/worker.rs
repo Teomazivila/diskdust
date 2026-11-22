@@ -102,12 +102,15 @@ fn clean(os: Os, home: &Path, findings: &[Finding], mode: DeleteMode, notifier: 
     let policy = SafetyPolicy::for_home(home);
     let audit = AuditLog::default_location(home, os, std::env::var_os("XDG_STATE_HOME").map(PathBuf::from));
     let cleaner = Cleaner { policy: &policy, runner: &runner, trasher: &SystemTrash, mode, allow_admin: false };
+    let run_id = AuditEntry::new_run_id();
+    tracing::info!(run_id = %run_id, items = findings.len(), ?mode, "clean started");
     let report = |finding: &Finding, action: &CleanupAction, ok: bool, message: String, elevated: bool| {
         let trashed =
             ok && !elevated && mode == DeleteMode::Trash && matches!(action, CleanupAction::RemovePath { .. });
         let bytes = reclaimed_bytes(finding, action, ok, &message);
         let entry = AuditEntry {
             timestamp: AuditEntry::now(),
+            run_id: run_id.clone(),
             finding_id: finding.id.clone(),
             title: finding.title.clone(),
             path: finding.path.clone(),
@@ -119,7 +122,7 @@ fn clean(os: Os, home: &Path, findings: &[Finding], mode: DeleteMode, notifier: 
             message: message.clone(),
         };
         if let Err(e) = audit.append(&entry) {
-            tracing::warn!(error = %e, path = %audit.path().display(), "could not write audit log");
+            tracing::warn!(run_id = %run_id, error = %e, path = %audit.path().display(), "could not write audit log");
         }
         notifier.send(Msg::Cleaned(CleanResult {
             id: finding.id.clone(),
