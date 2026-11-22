@@ -169,6 +169,10 @@ Built with `cargo-packager` 0.11.8 (config in `crates/diskdust/Cargo.toml` under
   and set the `APPLE_*` notarization variables cargo-packager reads.
 - Icons are regenerated from `assets/icon.svg` with `resvg` (PNG) and `iconutil` (ICNS); the generated files are
   committed so packaging needs neither tool.
+- Published builds come from CI: `.github/workflows/release.yml` (manual dispatch on `main`) builds
+  macOS arm64/Intel `.dmg` and Linux x86_64/arm64 `.deb` + `.AppImage` on native runners and creates the
+  tag and GitHub Release (see README, *Publishing a release*). This also covers the x86_64 AppImage that
+  cannot be built on Apple Silicon.
 - Verified 2026-11-22: macOS `.app`/`.dmg` (arm64) signature and checksum valid; `.deb` for arm64 and amd64
   installs, runs and uninstalls on Ubuntu 24.04; arm64 AppImage runs. The x86_64 AppImage could not be
   built on this Apple-Silicon machine (`linuxdeploy` aborts under x86 emulation); build it on a native
