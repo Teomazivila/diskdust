@@ -105,6 +105,8 @@ pub struct DiskdustApp {
     offer_empty_trash: bool,
     /// Entries shown in the History window, when open.
     history: Option<Vec<diskdust_core::audit::AuditEntry>>,
+    /// macOS Full Disk Access as probed at start; `None` once dismissed or when not applicable.
+    full_disk_access: Option<bool>,
     mode: DeleteMode,
     project_roots: Vec<PathBuf>,
     phase: Phase,
@@ -153,8 +155,47 @@ impl DiskdustApp {
             disk: None,
             offer_empty_trash: false,
             history: None,
+            full_disk_access: None,
         }
         .with_disk_space()
+        .with_access_probe()
+    }
+
+    fn with_access_probe(mut self) -> Self {
+        self.full_disk_access = diskdust_core::access::has_full_disk_access(self.os, &self.home);
+        self
+    }
+
+    /// Explains what is missing without Full Disk Access and links to the setting.
+    fn access_banner(&mut self, ui: &mut egui::Ui) {
+        if self.full_disk_access != Some(false) {
+            return;
+        }
+        egui::Frame::new()
+            .fill(SURFACE)
+            .stroke(egui::Stroke::new(1.0, ADMIN))
+            .corner_radius(6.0)
+            .inner_margin(10.0)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(
+                            "diskdust cannot read your Trash and some app data without Full Disk Access, so their \
+                             sizes show as unknown.",
+                        )
+                        .color(ADMIN),
+                    );
+                    if ui.button("Open Privacy settings").clicked()
+                        && let Err(e) = opener::open(diskdust_core::access::FULL_DISK_ACCESS_SETTINGS)
+                    {
+                        self.log(false, format!("Could not open System Settings: {e}"));
+                    }
+                    if ui.button("Dismiss").clicked() {
+                        self.full_disk_access = None;
+                    }
+                });
+            });
+        ui.add_space(6.0);
     }
 
     fn with_disk_space(mut self) -> Self {
@@ -997,6 +1038,7 @@ impl eframe::App for DiskdustApp {
             });
         }
         egui::CentralPanel::default().show(ui, |ui| {
+            self.access_banner(ui);
             if matches!(self.phase, Phase::Welcome) {
                 self.welcome(ui);
             } else {
@@ -1649,6 +1691,23 @@ mod tests {
             assert!(trash.is_dir(), "the Trash folder itself stays");
             assert!(!harness.state().offer_empty_trash);
             assert!(harness.state().status.starts_with("Cleaned 1 item, freed"), "{}", harness.state().status);
+        }
+
+        #[test]
+        fn full_disk_access_banner_can_be_dismissed() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let mut harness = harness(home.path());
+            harness.state_mut().full_disk_access = Some(false);
+            harness.run();
+            harness.get_by_label_contains("without Full Disk Access");
+            harness.get_by_label("Open Privacy settings");
+            save(&mut harness, "full-disk-access");
+            harness.get_by_label("Dismiss").click();
+            harness.run();
+            assert!(harness.query_by_label_contains("without Full Disk Access").is_none());
+            harness.state_mut().full_disk_access = Some(true);
+            harness.run();
+            assert!(harness.query_by_label_contains("without Full Disk Access").is_none());
         }
 
         #[test]
