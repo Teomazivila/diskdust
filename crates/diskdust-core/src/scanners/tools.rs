@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::{MIN_BYTES, ScanContext, ScanError, Scanner, base_finding, is_real_dir};
+use super::{MIN_BYTES, ScanContext, ScanError, Scanner, base_finding, is_real_dir, with_shared_note};
 use crate::model::{Category, CleanupAction, Finding, KnownCommand, Os, Privilege, Risk, SPECIFIC};
 use crate::units::parse_journal_usage;
 
@@ -34,11 +34,11 @@ fn measured_finding(
     if !is_real_dir(&path) {
         return None;
     }
-    let bytes = ctx.measure(&path).bytes;
-    (bytes >= MIN_BYTES).then(|| Finding {
-        detail: detail.to_owned(),
+    let report = ctx.measure(&path)?;
+    (report.bytes >= MIN_BYTES).then(|| Finding {
+        detail: with_shared_note(detail.to_owned(), &report),
         path: Some(path),
-        bytes: Some(bytes),
+        bytes: Some(report.bytes),
         risk: Risk::Safe,
         action: Some(CleanupAction::Run(cmd)),
         specificity: SPECIFIC,
@@ -162,7 +162,10 @@ impl Scanner for SimulatorScanner {
             return Ok(Vec::new());
         }
         let devices = ctx.home.join("Library/Developer/CoreSimulator/Devices");
-        let bytes: u64 = udids.iter().map(|id| ctx.measure(&devices.join(id)).bytes).sum();
+        let Some(bytes) = udids.iter().map(|id| ctx.measure(&devices.join(id)).map(|r| r.bytes)).sum::<Option<u64>>()
+        else {
+            return Ok(Vec::new());
+        };
         Ok(vec![Finding {
             detail: format!("{} simulators whose iOS runtime is no longer installed.", udids.len()),
             path: Some(devices),

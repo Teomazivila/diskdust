@@ -30,7 +30,9 @@ impl Scanner for TrashScanner {
         let base = base_finding("trash", "trash:user".to_owned(), Category::Trash, "Trash".to_owned());
         match fs::read_dir(&path) {
             Ok(_) => {
-                let bytes = ctx.measure(&path).bytes;
+                let Some(bytes) = ctx.measure(&path).map(|r| r.bytes) else {
+                    return Ok(Vec::new());
+                };
                 if bytes == 0 || fs::read_dir(&path).is_ok_and(|mut d| d.next().is_none()) {
                     return Ok(Vec::new());
                 }

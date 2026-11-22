@@ -66,8 +66,10 @@ impl ScanContext<'_> {
         self.system_root.join(absolute.trim_start_matches('/'))
     }
 
-    pub fn measure(&self, path: &Path) -> SizeReport {
-        size::measure(path, self.cancel)
+    /// Measures `path`; `None` when the scan was cancelled mid-walk (the figures would be partial).
+    pub fn measure(&self, path: &Path) -> Option<SizeReport> {
+        let report = size::measure(path, self.cancel);
+        report.complete.then_some(report)
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -148,6 +150,18 @@ pub fn default_scanners() -> Vec<Box<dyn Scanner>> {
         Box::new(JournalScanner),
         Box::new(SnapScanner),
     ]
+}
+
+/// Appends a note when part of an item is hard-linked from elsewhere and is not freed by removing
+/// it alone (e.g. `node_modules` installed by pnpm).
+pub(crate) fn with_shared_note(detail: String, report: &SizeReport) -> String {
+    if report.shared < MIN_BYTES {
+        return detail;
+    }
+    format!(
+        "{detail} Another {} is hard-linked from elsewhere (e.g. a package store) and is not freed by removing only this item.",
+        crate::units::format_bytes(report.shared)
+    )
 }
 
 /// Base finding with conservative defaults; callers override fields with struct update syntax.
@@ -299,12 +313,24 @@ mod tests {
     }
 
     #[test]
+    fn shared_note_only_when_significant() {
+        let small = SizeReport { shared: 10, ..SizeReport::default() };
+        assert_eq!(with_shared_note("d.".into(), &small), "d.");
+        let big = SizeReport { shared: 2_000_000, ..SizeReport::default() };
+        assert!(with_shared_note("d.".into(), &big).contains("2.0 MB is hard-linked"));
+    }
+
+    #[test]
     fn context_helpers() {
         let env = Env::new();
         let runner = crate::command::fake::FakeRunner::new();
         let ctx = env.ctx(Os::Linux, &runner);
         assert_eq!(ctx.system_path("/var/cache"), env.system.join("var/cache"));
         assert!(!ctx.is_cancelled());
+        assert!(ctx.measure(&env.home).is_some());
+        ctx.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        env.file("sub/x", 1);
+        assert!(ctx.measure(&env.home).is_none(), "cancelled walks are partial");
         assert!(format!("{ctx:?}").contains("ScanContext"));
         assert!(is_real_dir(&env.home));
         assert_eq!(file_name(Path::new("/")), "/");

@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 
-use super::{MIN_BYTES, ScanContext, ScanError, Scanner, base_finding, children, file_name, is_real_dir};
+use super::{
+    MIN_BYTES, ScanContext, ScanError, Scanner, base_finding, children, file_name, is_real_dir, with_shared_note,
+};
 use crate::model::{Category, CleanupAction, Finding, GENERIC, KnownCommand, Os, Privilege, Risk, SPECIFIC};
 
 /// Where a rule's relative path is anchored.
@@ -475,8 +477,8 @@ impl PathRulesScanner {
         if ctx.is_cancelled() {
             return None;
         }
-        let bytes = ctx.measure(path).bytes;
-        if bytes < MIN_BYTES {
+        let report = ctx.measure(path)?;
+        if report.bytes < MIN_BYTES {
             return None;
         }
         let action = match &rule.command {
@@ -484,9 +486,9 @@ impl PathRulesScanner {
             None => CleanupAction::RemovePath { path: path.to_path_buf(), root: root.to_path_buf() },
         };
         Some(Finding {
-            detail,
+            detail: with_shared_note(detail, &report),
             path: Some(path.to_path_buf()),
-            bytes: Some(bytes),
+            bytes: Some(report.bytes),
             risk: rule.risk,
             privilege: rule.privilege,
             action: Some(action),
