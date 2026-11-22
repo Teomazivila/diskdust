@@ -111,7 +111,6 @@ pub enum KnownCommand {
     DnfClean,
     PacmanClean,
     SnapRemoveRevision { name: String, revision: String },
-    FlatpakUninstallUnused,
 }
 
 impl KnownCommand {
@@ -132,7 +131,6 @@ impl KnownCommand {
             Self::AptClean => &["apt-get", "clean"],
             Self::DnfClean => &["dnf", "clean", "all"],
             Self::PacmanClean => &["pacman", "-Sc", "--noconfirm"],
-            Self::FlatpakUninstallUnused => &["flatpak", "uninstall", "--unused", "-y"],
             Self::SnapRemoveRevision { name, revision } => {
                 return vec!["snap".to_owned(), "remove".to_owned(), name.clone(), format!("--revision={revision}")];
             }
@@ -306,7 +304,6 @@ mod tests {
             KnownCommand::AptClean,
             KnownCommand::DnfClean,
             KnownCommand::PacmanClean,
-            KnownCommand::FlatpakUninstallUnused,
         ];
         for cmd in all {
             let argv = cmd.argv();

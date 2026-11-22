@@ -429,6 +429,16 @@ pub fn default_rules() -> Vec<PathRule> {
         .system_admin()
         .command(KnownCommand::DnfClean, "dnf"),
         PathRule::new(
+            "dnf5-cache",
+            "DNF5 package cache",
+            "Downloaded packages and metadata (DNF5, Fedora 41+). Cleaned with `dnf clean all`.",
+            LINUX,
+            "var/cache/libdnf5",
+        )
+        .category(C::System)
+        .system_admin()
+        .command(KnownCommand::DnfClean, "dnf"),
+        PathRule::new(
             "pacman-cache",
             "pacman package cache",
             "Cached packages of uninstalled software. Cleaned with `pacman -Sc`.",
@@ -698,6 +708,17 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].privilege, Privilege::Admin);
         assert_eq!(found[0].action, Some(CleanupAction::Run(KnownCommand::AptClean)));
+    }
+
+    #[test]
+    fn dnf5_cache_is_covered() {
+        let env = Env::new();
+        env.sys_file("var/cache/libdnf5/fedora-abc/packages/x.rpm", BIG);
+        let runner = FakeRunner::new().installed("dnf");
+        let found = scan(&env, Os::Linux, &runner);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].title, "DNF5 package cache");
+        assert_eq!(found[0].action, Some(CleanupAction::Run(KnownCommand::DnfClean)));
     }
 
     #[test]
