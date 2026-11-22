@@ -32,7 +32,7 @@ diskdust/                     (Cargo workspace)
 │   ├── units.rs              Docker/journalctl size parsing, human formatting
 │   ├── scan.rs               scan orchestration, progress events, overlap dedupe
 │   ├── scanners/             path rules table + Docker, Homebrew, Go, Trash, Time Machine,
-│   │                         journald, apt/dnf/pacman, snap, flatpak, orphaned app data,
+│   │                         journald, apt/dnf/dnf5/pacman, snap, orphaned app data,
 │   │                         build artifacts
 │   ├── clean.rs              executor (trash / permanent / known commands)
 │   ├── audit.rs              JSONL deletion log
@@ -84,9 +84,11 @@ diskdust/                     (Cargo workspace)
 ## 6. Quality gates
 
 - `cargo fmt --all --check`
-- `cargo clippy --workspace --all-targets -- -D warnings` (pedantic on)
-- `cargo test --workspace`
-- `cargo llvm-cov -p diskdust-core` ≥ 80% lines
+- `cargo clippy --locked --workspace --all-targets -- -D warnings` (pedantic on)
+- `cargo test --locked --workspace`
+- `cargo llvm-cov --locked -p diskdust-core --fail-under-lines 80`
+- `cargo audit --deny warnings` and `cargo deny --locked check`
+- Toolchain pinned in `rust-toolchain.toml`; all gates run in CI (`.github/workflows/ci.yml`) on macOS and Linux.
 - Core tests also run inside a Linux container (`rust:1.100`) to exercise Linux code paths.
 - Manual verification: scan-only run on macOS, then a trash-mode clean of a disposable fixture.
 
@@ -130,8 +132,11 @@ Deviations from the original plan, with reasons:
 
 Remaining manual checks (need an interactive session on macOS):
 
-1. "Move to Trash" on a real item (uses `NSFileManager`; no Finder automation prompt expected).
+1. ~~"Move to Trash" on a real item~~ — verified 2026-11-22 with the opt-in test
+   `system_trash_moves_a_real_file` (see `REMEDIATION_PLAN.md` B5).
 2. An admin clean (e.g. `/Library/Logs/DiagnosticReports`) to exercise the macOS password prompt.
+
+Review findings and their remediation are tracked in [`REMEDIATION_PLAN.md`](REMEDIATION_PLAN.md).
 
 ### 9.1 Iteration 2 (2026-11-22, after first real use)
 

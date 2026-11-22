@@ -21,33 +21,33 @@
 
 | ID | Gap | Fix | Status |
 |---|---|---|---|
-| R1 | No toolchain pin; fresh clone on Rust 1.98 does not build | `rust-toolchain.toml` pinned to 1.100 with `rustfmt`, `clippy`, `llvm-tools` | PR 1 |
-| R2 | No CI; every gate is manual | `.github/workflows/ci.yml`: fmt, clippy (`--locked`, `-D warnings`), tests on macOS + Linux, coverage ≥ 80 % gate, `cargo audit`, `cargo deny`; actions pinned by commit SHA, least-privilege `permissions` | PR 1 |
-| R3 | `cargo audit` fails; no `deny.toml` | `deny.toml` (license allowlist, sources, bans) and `.cargo/audit.toml`. The 4 *unmaintained* advisories (`ttf-parser`, `zbus_names`, `zvariant`, `zvariant_derive`) come from `egui`/`epaint` (fonts) and `accesskit_unix`/`opener` (D-Bus). Every upstream crate is already at its latest release (`cargo update --dry-run`: 0 packages), and removing them would mean dropping accessibility on Linux — so they are ignored with a written justification and re-reviewed on every egui upgrade. No vulnerability advisories exist. | PR 1 |
-| R4 | Documented gates omit `--locked` | `PLAN.md` §6 and README use `--locked` | PR 1 |
+| R1 | No toolchain pin; fresh clone on Rust 1.98 does not build | `rust-toolchain.toml` pinned to 1.100 with `rustfmt`, `clippy`, `llvm-tools` | ✅ Done (`920c300`) |
+| R2 | No CI; every gate is manual | `.github/workflows/ci.yml`: fmt, clippy (`--locked`, `-D warnings`), tests on macOS + Linux, coverage ≥ 80 % gate, `cargo audit`, `cargo deny`; actions pinned by commit SHA, least-privilege `permissions` | ✅ Done (`e9e219b`) |
+| R3 | `cargo audit` fails; no `deny.toml` | `deny.toml` (license allowlist, sources, bans) and `.cargo/audit.toml`. The 4 *unmaintained* advisories (`ttf-parser`, `zbus_names`, `zvariant`, `zvariant_derive`) come from `egui`/`epaint` (fonts) and `accesskit_unix`/`opener` (D-Bus). Every upstream crate is already at its latest release (`cargo update --dry-run`: 0 packages), and removing them would mean dropping accessibility on Linux — so they are ignored with a written justification and re-reviewed on every egui upgrade. No vulnerability advisories exist. | ✅ Done (`920c300`) |
+| R4 | Documented gates omit `--locked` | `PLAN.md` §6 and README use `--locked` | ✅ Done (README, PLAN.md) |
 | R5 | `d6a0c99` committed directly to `main` | History is not rewritten (no force-push on shared branches). Recommend enabling branch protection on `main` (require PR + CI) — repository setting, owner action | Owner |
-| R6 | No property-based tests for parsers and safety rules | `proptest` (dev-dependency) for `units`, `privilege::decode_payload`, `safety` | PR 1 |
-| R7 | Audit entries cannot be grouped per clean run | `run_id` on every `AuditEntry` (backwards-compatible: missing field deserializes as empty) | PR 1 |
+| R6 | No property-based tests for parsers and safety rules | `proptest` (dev-dependency) for `units`, `privilege::decode_payload`, `safety` | ✅ Done (`f5605c2`) |
+| R7 | Audit entries cannot be grouped per clean run | `run_id` on every `AuditEntry` (backwards-compatible: missing field deserializes as empty) | ✅ Done (`0741a68`) |
 
 ## 3. Defects (PR 1)
 
 | ID | Sev. | Defect | Fix | Status |
 |---|---|---|---|---|
-| B1 | High | Hard-linked files are de-duplicated per measurement only, so pnpm `node_modules` and the pnpm store each report bytes that deleting them alone does not free | Walker counts how many links of each inode lie inside the measured tree; bytes of inodes with links outside are reported as *shared*, not reclaimable. Findings show the shared amount in their detail | PR 1 |
-| B2 | High | Every `~/Library/Caches/*` child (incl. `com.apple.*`) is `Safe` and picked by **Select safe** | `com.apple.*` children of user/system cache folders are `Review` with an explanation | PR 1 |
-| B3 | High | Root helper resolves programs through user-writable dirs (`/usr/local/bin`, `/opt/homebrew/bin`, linuxbrew) and passes that `PATH` to root children | `SystemRunner::trusted()`: fixed system search path, `env_clear()`, fixed `PATH`/`LC_ALL`; used by the helper | PR 1 |
-| B4 | High | Linux AppImage + `pkexec`: `current_exe()` is inside the user's FUSE mount, which root cannot open | Elevate the AppImage file itself (`$APPIMAGE`, validated absolute regular file) when present | PR 1 (end-to-end pkexec run needs a Linux desktop session) |
-| B5 | High | Real "Move to Trash" and macOS admin clean never verified | Ignored integration test that trashes a disposable file via `SystemTrash`, run locally on macOS. Admin clean needs an interactive password prompt → owner check | PR 1 / Owner |
-| B6 | Med | Confirm dialog in Trash mode does not say which items are removed permanently (Trash emptying, tool commands, admin items) | Dialog counts and lists permanent items in Trash mode | PR 1 |
-| B7 | Med | systemd journal reports total usage, but `--vacuum-time=7d` frees only older files | Estimate = archived journal files older than 7 days; total usage shown in the detail; unknown when unreadable | PR 1 |
-| B8 | Med | `KnownCommand::FlatpakUninstallUnused` is in the allowlist without a scanner | Removed (shrinks the allowlist) | PR 1 |
-| B9 | Med | DNF5 cache (`/var/cache/libdnf5`, Fedora 41+) not covered | New rule, cleaned with `dnf clean all` | PR 1 |
-| B10 | Med | Cancelled scan shows partially-measured sizes as real | `SizeReport::complete`; findings whose measurement was cut short are dropped | PR 1 |
-| B11 | Med | UI test hard-codes the audit path and fails when `XDG_STATE_HOME` is set | Test resolves the path with the same function as the worker | PR 1 |
-| B12 | Low | Selection survives a rescan | Selection cleared when a scan starts | PR 1 |
-| B13 | Low | `encode_payload` swallows serialization errors | Returns `Result`; caller reports the error | PR 1 |
-| B14 | Low | Generic `.cache/*` / `Library/Caches/*` rules walk folders that specific rules also walk | Children equal to an applicable specific rule's target are skipped | PR 1 |
-| B15 | Low | Default project root `~/Documents` triggers a macOS privacy prompt with no warning | Welcome screen and README explain the prompt and how to remove the folder | PR 1 |
+| B1 | High | Hard-linked files are de-duplicated per measurement only, so pnpm `node_modules` and the pnpm store each report bytes that deleting them alone does not free | Walker counts how many links of each inode lie inside the measured tree; bytes of inodes with links outside are reported as *shared*, not reclaimable. Findings show the shared amount in their detail | ✅ Done (`147d399`) |
+| B2 | High | Every `~/Library/Caches/*` child (incl. `com.apple.*`) is `Safe` and picked by **Select safe** | `com.apple.*` children of user/system cache folders are `Review` with an explanation | ✅ Done (`6330f2e`) |
+| B3 | High | Root helper resolves programs through user-writable dirs (`/usr/local/bin`, `/opt/homebrew/bin`, linuxbrew) and passes that `PATH` to root children | `SystemRunner::trusted()`: fixed system search path, `env_clear()`, fixed `PATH`/`LC_ALL`; used by the helper | ✅ Done (`4e04b12`) |
+| B4 | High | Linux AppImage + `pkexec`: `current_exe()` is inside the user's FUSE mount, which root cannot open | Elevate the AppImage file itself (`$APPIMAGE`, validated absolute regular file) when present | ✅ Done (`4e04b12`); end-to-end `pkexec` run needs a Linux desktop session → owner check |
+| B5 | High | Real "Move to Trash" and macOS admin clean never verified | Ignored integration test that trashes a disposable file via `SystemTrash`, run locally on macOS. Admin clean needs an interactive password prompt → owner check | ✅ Trash verified (`498f70b`); admin password prompt → owner check |
+| B6 | Med | Confirm dialog in Trash mode does not say which items are removed permanently (Trash emptying, tool commands, admin items) | Dialog counts and lists permanent items in Trash mode | ✅ Done (`dd0584a`) |
+| B7 | Med | systemd journal reports total usage, but `--vacuum-time=7d` frees only older files | Estimate = archived journal files older than 7 days; total usage shown in the detail; unknown when unreadable | ✅ Done (`9dc9a2f`) |
+| B8 | Med | `KnownCommand::FlatpakUninstallUnused` is in the allowlist without a scanner | Removed (shrinks the allowlist) | ✅ Done (`32b6454`) |
+| B9 | Med | DNF5 cache (`/var/cache/libdnf5`, Fedora 41+) not covered | New rule, cleaned with `dnf clean all` | ✅ Done (`32b6454`) |
+| B10 | Med | Cancelled scan shows partially-measured sizes as real | `SizeReport::complete`; findings whose measurement was cut short are dropped | ✅ Done (`147d399`) |
+| B11 | Med | UI test hard-codes the audit path and fails when `XDG_STATE_HOME` is set | Test resolves the path with the same function as the worker | ✅ Done (`dd0584a`) |
+| B12 | Low | Selection survives a rescan | Selection cleared when a scan starts | ✅ Done (`dd0584a`) |
+| B13 | Low | `encode_payload` swallows serialization errors | Returns `Result`; caller reports the error | ✅ Done (`4e04b12`) |
+| B14 | Low | Generic `.cache/*` / `Library/Caches/*` rules walk folders that specific rules also walk | Children equal to an applicable specific rule's target are skipped | ✅ Done (`6330f2e`) |
+| B15 | Low | Default project root `~/Documents` triggers a macOS privacy prompt with no warning | Welcome screen and README explain the prompt and how to remove the folder | ✅ Done (`dd0584a`) |
 
 ## 4. Features (PR 2)
 
