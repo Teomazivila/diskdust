@@ -1,0 +1,50 @@
+[package]
+name = "diskdust"
+description = "Find and reclaim hidden disk space on macOS and Linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+diskdust-core.workspace = true
+anyhow.workspace = true
+dirs.workspace = true
+eframe.workspace = true
+egui.workspace = true
+egui_extras.workspace = true
+opener.workspace = true
+rfd.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+egui_kittest = { version = "0.37.0", features = ["eframe", "wgpu", "snapshot"] }
+
+# Installers: `cargo packager --release` (see PLAN.md §10).
+[package.metadata.packager]
+product-name = "diskdust"
+identifier = "dev.diskdust.app"
+description = "Find and reclaim hidden disk space"
+long-description = "diskdust finds reclaimable space in Docker, ~/Library, developer caches, build folders and system caches, and cleans it safely."
+category = "Utility"
+copyright = "Copyright © 2026 diskdust contributors"
+authors = ["diskdust contributors"]
+before-packaging-command = "cargo build --release -p diskdust"
+icons = ["../../assets/icon.icns", "../../assets/icon-32.png", "../../assets/icon-128.png", "../../assets/icon-256.png", "../../assets/icon-512.png"]
+binaries = [{ path = "diskdust", main = true }]
+
+[package.metadata.packager.macos]
+minimum-system-version = "12.0"
+# Ad-hoc signature over the whole bundle (no Apple Developer ID required; see PLAN.md §10).
+signing-identity = "-"
+
+[package.metadata.packager.deb]
+section = "utils"
+depends = ["libxkbcommon0", "libxkbcommon-x11-0"]

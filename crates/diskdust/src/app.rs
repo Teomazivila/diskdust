@@ -1,0 +1,1053 @@
+//! The egui application.
+
+use std::collections::{BTreeMap, HashSet};
+use std::fmt::Write as _;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, channel};
+use std::time::Instant;
+
+use diskdust_core::clean::DeleteMode;
+use diskdust_core::model::{Category, Finding, Os, Privilege, Risk};
+use diskdust_core::scan::ScanEvent;
+use diskdust_core::scanners::{default_project_roots, unique_dirs};
+use egui::{Align, Color32, Layout, RichText, Sense, vec2};
+use egui_extras::{Column, TableBuilder};
+
+use crate::format;
+use crate::worker::{self, CleanResult, Msg, Notifier};
+
+const SAFE: Color32 = Color32::from_rgb(102, 187, 106);
+const REVIEW: Color32 = Color32::from_rgb(255, 183, 77);
+const INFO: Color32 = Color32::from_rgb(144, 164, 174);
+const ADMIN: Color32 = Color32::from_rgb(100, 181, 246);
+const DANGER: Color32 = Color32::from_rgb(229, 115, 115);
+const ACCENT: Color32 = Color32::from_rgb(126, 87, 194);
+const MAX_ACTIVITY: usize = 300;
+
+// Every icon the UI draws. They must exist in the bundled fonts (see `all_icons_have_glyphs`).
+const ICON_REMOVE: &str = "×";
+const ICON_OK: &str = "✔";
+const ICON_FAIL: &str = "✖";
+const ICON_REVEAL: &str = "↗";
+const ICON_LOCK: &str = "🔒";
+const ICON_WARN: &str = "⚠";
+#[cfg(test)]
+const ALL_ICONS: [&str; 6] = [ICON_REMOVE, ICON_OK, ICON_FAIL, ICON_REVEAL, ICON_LOCK, ICON_WARN];
+
+/// Pure black background with slightly lifted surfaces so inputs and rows stay distinguishable.
+const BG: Color32 = Color32::BLACK;
+const SURFACE: Color32 = Color32::from_rgb(16, 16, 19);
+const SURFACE_STRIPE: Color32 = Color32::from_rgb(11, 11, 13);
+const BORDER: Color32 = Color32::from_rgb(38, 38, 44);
+
+#[derive(Debug)]
+enum Phase {
+    /// No scan has run yet.
+    Welcome,
+    Idle,
+    Scanning {
+        started: Instant,
+        running: Vec<&'static str>,
+        finished: usize,
+    },
+    Cleaning {
+        total: usize,
+        done: usize,
+    },
+}
+
+#[derive(Debug)]
+struct Activity {
+    ok: bool,
+    text: String,
+}
+
+/// Outcome totals of the clean currently running or last finished.
+#[derive(Debug, Default)]
+struct CleanTally {
+    freed: u64,
+    trashed: u64,
+    ok: usize,
+    failed: usize,
+}
+
+#[derive(Debug)]
+pub struct DiskdustApp {
+    os: Os,
+    home: PathBuf,
+    findings: Vec<Finding>,
+    selected: HashSet<String>,
+    category: Option<Category>,
+    search: String,
+    mode: DeleteMode,
+    project_roots: Vec<PathBuf>,
+    phase: Phase,
+    cancel: Arc<AtomicBool>,
+    notifier: Notifier,
+    rx: Receiver<Msg>,
+    confirm_open: bool,
+    activity: Vec<Activity>,
+    status: String,
+    tally: CleanTally,
+}
+
+impl DiskdustApp {
+    pub fn new(cc: &eframe::CreationContext<'_>, os: Os, home: PathBuf) -> Self {
+        configure_style(&cc.egui_ctx);
+        let (tx, rx) = channel();
+        let project_roots = default_project_roots(&home);
+        Self {
+            os,
+            home,
+            findings: Vec::new(),
+            selected: HashSet::new(),
+            category: None,
+            search: String::new(),
+            mode: DeleteMode::Trash,
+            project_roots,
+            phase: Phase::Welcome,
+            cancel: Arc::new(AtomicBool::new(false)),
+            notifier: Notifier::new(tx, cc.egui_ctx.clone()),
+            rx,
+            confirm_open: false,
+            activity: Vec::new(),
+            status: "Ready. Scanning only reads; nothing is removed until you confirm.".to_owned(),
+            tally: CleanTally::default(),
+        }
+    }
+
+    const fn busy(&self) -> bool {
+        matches!(self.phase, Phase::Scanning { .. } | Phase::Cleaning { .. })
+    }
+
+    fn log(&mut self, ok: bool, text: String) {
+        self.activity.push(Activity { ok, text });
+        if self.activity.len() > MAX_ACTIVITY {
+            self.activity.remove(0);
+        }
+    }
+
+    fn start_scan(&mut self) {
+        self.cancel = Arc::new(AtomicBool::new(false));
+        self.phase = Phase::Scanning { started: Instant::now(), running: Vec::new(), finished: 0 };
+        "Scanning…".clone_into(&mut self.status);
+        worker::spawn_scan(
+            self.os,
+            self.home.clone(),
+            self.project_roots.clone(),
+            Arc::clone(&self.cancel),
+            self.notifier.clone(),
+        );
+    }
+
+    fn start_clean(&mut self) {
+        let items: Vec<Finding> =
+            self.findings.iter().filter(|f| self.selected.contains(&f.id) && f.is_actionable()).cloned().collect();
+        if items.is_empty() {
+            return;
+        }
+        self.tally = CleanTally::default();
+        self.phase = Phase::Cleaning { total: items.len(), done: 0 };
+        self.status = format!("Cleaning {}…", format::items(items.len()));
+        worker::spawn_clean(self.os, self.home.clone(), items, self.mode, self.notifier.clone());
+    }
+
+    fn drain_messages(&mut self) {
+        while let Ok(msg) = self.rx.try_recv() {
+            match msg {
+                Msg::Scan(event) => self.on_scan_event(event),
+                Msg::ScanDone { findings, elapsed, cancelled } => {
+                    self.selected.retain(|id| findings.iter().any(|f| &f.id == id));
+                    self.findings = findings;
+                    let total: u64 =
+                        self.findings.iter().filter(|f| f.is_actionable()).map(Finding::bytes_or_zero).sum();
+                    self.status = format!(
+                        "{} in {} · {} items · {} reclaimable",
+                        if cancelled { "Scan cancelled" } else { "Scanned" },
+                        format::duration(elapsed),
+                        self.findings.len(),
+                        format::bytes(total)
+                    );
+                    self.phase = Phase::Idle;
+                }
+                Msg::Cleaned(result) => self.on_cleaned(&result),
+                Msg::CleanDone => {
+                    self.status = clean_summary(&self.tally);
+                    self.phase = Phase::Idle;
+                }
+            }
+        }
+    }
+
+    fn on_scan_event(&mut self, event: ScanEvent) {
+        if let Phase::Scanning { running, finished, .. } = &mut self.phase {
+            match &event {
+                ScanEvent::Started { name, .. } => running.push(name),
+                ScanEvent::Finished { name, .. } => {
+                    running.retain(|n| n != name);
+                    *finished += 1;
+                }
+            }
+        }
+        if let ScanEvent::Finished { name, error: Some(error), .. } = event {
+            self.log(false, format!("{name}: {error}"));
+        }
+    }
+
+    fn on_cleaned(&mut self, r: &CleanResult) {
+        if let Phase::Cleaning { done, .. } = &mut self.phase {
+            *done += 1;
+        }
+        if r.ok {
+            self.tally.ok += 1;
+            let bytes = r.bytes.unwrap_or(0);
+            if r.trashed {
+                self.tally.trashed += bytes;
+            } else {
+                self.tally.freed += bytes;
+            }
+            self.findings.retain(|f| f.id != r.id);
+            self.selected.remove(&r.id);
+        } else {
+            self.tally.failed += 1;
+        }
+        self.log(r.ok, format!("{} — {}", r.title, r.message));
+    }
+
+    fn visible(&self) -> Vec<usize> {
+        let needle = self.search.to_lowercase();
+        self.findings
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| self.category.is_none_or(|c| f.category == c))
+            .filter(|(_, f)| {
+                needle.is_empty()
+                    || f.title.to_lowercase().contains(&needle)
+                    || f.detail.to_lowercase().contains(&needle)
+                    || f.path.as_ref().is_some_and(|p| p.to_string_lossy().to_lowercase().contains(&needle))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Adds every visible, actionable finding matching `keep` to the selection.
+    fn select_visible(&mut self, keep: impl Fn(&Finding) -> bool) {
+        for i in self.visible() {
+            let f = &self.findings[i];
+            if f.is_actionable() && keep(f) {
+                self.selected.insert(f.id.clone());
+            }
+        }
+    }
+
+    fn selection_summary(&self) -> (usize, u64) {
+        self.findings
+            .iter()
+            .filter(|f| self.selected.contains(&f.id))
+            .fold((0, 0), |(n, b), f| (n + 1, b + f.bytes_or_zero()))
+    }
+
+    // ---- Panels ------------------------------------------------------------------------------
+
+    fn toolbar(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("diskdust").size(22.0).strong().color(ACCENT));
+            ui.label(RichText::new("find and reclaim hidden disk space").weak());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let (count, bytes) = self.selection_summary();
+                let clean_label = if count == 0 {
+                    "Clean selected".to_owned()
+                } else {
+                    format!("Clean {count} · {}", format::bytes(bytes))
+                };
+                let clean = egui::Button::new(RichText::new(clean_label).strong()).fill(if count > 0 {
+                    ACCENT
+                } else {
+                    ui.visuals().widgets.inactive.weak_bg_fill
+                });
+                if ui.add_enabled(count > 0 && !self.busy(), clean).clicked() {
+                    self.confirm_open = true;
+                }
+                ui.separator();
+                ui.selectable_value(&mut self.mode, DeleteMode::Permanent, "Delete permanently")
+                    .on_hover_text("Remove files immediately. Cannot be undone.");
+                ui.selectable_value(&mut self.mode, DeleteMode::Trash, "Move to Trash")
+                    .on_hover_text("Recoverable. Space is reclaimed when you empty the Trash.");
+                ui.separator();
+                if let Phase::Scanning { .. } = self.phase {
+                    if ui.button("Cancel scan").clicked() {
+                        self.cancel.store(true, Ordering::Relaxed);
+                    }
+                } else {
+                    let label = if matches!(self.phase, Phase::Welcome) { "Scan" } else { "Rescan" };
+                    if ui.add_enabled(!self.busy(), egui::Button::new(label)).clicked() {
+                        self.start_scan();
+                    }
+                }
+            });
+        });
+        ui.add_space(6.0);
+    }
+
+    fn sidebar(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+        let mut totals: BTreeMap<Category, Totals> = BTreeMap::new();
+        let mut all = Totals::default();
+        for f in &self.findings {
+            totals.entry(f.category).or_default().add(f);
+            all.add(f);
+        }
+        category_row(ui, &mut self.category, None, "All items", &all);
+        ui.add_space(4.0);
+        for category in Category::ALL {
+            if let Some(t) = totals.get(&category) {
+                category_row(ui, &mut self.category, Some(category), category.label(), t);
+            }
+        }
+        ui.add_space(8.0);
+        ui.separator();
+        ui.label(RichText::new("Selection").strong());
+        ui.horizontal_wrapped(|ui| {
+            let busy = self.busy();
+            if ui
+                .add_enabled(!busy, egui::Button::new("Select all"))
+                .on_hover_text("Select every visible item, including ones marked Review")
+                .clicked()
+            {
+                self.select_visible(|_| true);
+            }
+            if ui
+                .add_enabled(!busy, egui::Button::new("Select safe"))
+                .on_hover_text("Select every visible item marked Safe")
+                .clicked()
+            {
+                self.select_visible(|f| f.risk == Risk::Safe);
+            }
+            if ui.add_enabled(!busy, egui::Button::new("Clear")).clicked() {
+                self.selected.clear();
+            }
+        });
+        ui.add_space(8.0);
+        ui.separator();
+        ui.label(RichText::new("Project folders").strong())
+            .on_hover_text("Searched for target/, node_modules/ and other build output");
+        let mut remove = None;
+        for (i, root) in self.project_roots.iter().enumerate() {
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!self.busy(), egui::Button::new(ICON_REMOVE).small())
+                    .on_hover_text("Remove")
+                    .clicked()
+                {
+                    remove = Some(i);
+                }
+                ui.label(RichText::new(display_path(root, &self.home)).small())
+                    .on_hover_text(root.display().to_string());
+            });
+        }
+        if let Some(i) = remove {
+            self.project_roots.remove(i);
+        }
+        if ui.add_enabled(!self.busy(), egui::Button::new("Add folder…")).clicked()
+            && let Some(folder) = rfd::FileDialog::new().set_directory(&self.home).pick_folder()
+        {
+            let mut roots = self.project_roots.clone();
+            roots.push(folder);
+            self.project_roots = unique_dirs(roots);
+        }
+    }
+
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| match &self.phase {
+            Phase::Scanning { started, running, finished } => {
+                ui.spinner();
+                let current = running.first().copied().unwrap_or("Finishing");
+                ui.label(format!(
+                    "Scanning… {finished} sources done · {current} · {}",
+                    format::duration(started.elapsed())
+                ));
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+            }
+            Phase::Cleaning { total, done } => {
+                ui.spinner();
+                #[allow(clippy::cast_precision_loss)]
+                let fraction = *done as f32 / (*total).max(1) as f32;
+                ui.add(egui::ProgressBar::new(fraction).desired_width(200.0).text(format!("{done}/{total}")));
+                ui.label(&self.status);
+            }
+            Phase::Idle | Phase::Welcome => {
+                ui.label(&self.status);
+            }
+        });
+        egui::CollapsingHeader::new(format!("Activity ({})", self.activity.len())).id_salt("activity").show(ui, |ui| {
+            egui::ScrollArea::vertical().max_height(140.0).stick_to_bottom(true).show(ui, |ui| {
+                for a in &self.activity {
+                    let (icon, color) = if a.ok { (ICON_OK, SAFE) } else { (ICON_FAIL, DANGER) };
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(icon).color(color));
+                        ui.label(RichText::new(&a.text).small());
+                    });
+                }
+            });
+        });
+        ui.add_space(4.0);
+    }
+
+    fn welcome(&mut self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(ui.available_height() * 0.25);
+            ui.label(RichText::new("Where did my disk space go?").size(28.0).strong());
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(
+                    "diskdust looks in Docker, ~/Library, developer caches, build folders and system caches.\n\
+                     Scanning is read-only. Nothing is removed until you select items and confirm.",
+                )
+                .weak(),
+            );
+            ui.add_space(18.0);
+            let label = match self.os {
+                Os::MacOs => "Scan this Mac",
+                Os::Linux => "Scan this computer",
+            };
+            let button =
+                egui::Button::new(RichText::new(label).size(18.0).strong()).fill(ACCENT).min_size(vec2(220.0, 44.0));
+            if ui.add(button).clicked() {
+                self.start_scan();
+            }
+        });
+    }
+
+    fn filter_bar(&mut self, ui: &mut egui::Ui, visible: &[usize]) {
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.search).hint_text("Filter by name or path…").desired_width(280.0),
+            );
+            let mut shown = Totals::default();
+            for i in visible {
+                shown.add(&self.findings[*i]);
+            }
+            ui.label(RichText::new(format!("{} · {} reclaimable", format::items(shown.count), shown.label())).weak());
+        });
+        ui.add_space(4.0);
+    }
+
+    fn table(&mut self, ui: &mut egui::Ui) {
+        let visible = self.visible();
+        self.filter_bar(ui, &visible);
+        if visible.is_empty() {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
+                let text = if matches!(self.phase, Phase::Scanning { .. }) {
+                    "Scanning…"
+                } else {
+                    "Nothing to show. Your disk is looking tidy."
+                };
+                ui.label(RichText::new(text).weak().size(16.0));
+            });
+            return;
+        }
+        let max_bytes = visible
+            .iter()
+            .map(|i| &self.findings[*i])
+            .filter(|f| f.is_actionable())
+            .map(Finding::bytes_or_zero)
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let busy = self.busy();
+        let text_height = ui.text_style_height(&egui::TextStyle::Body);
+        let row_height = text_height * 2.0 + 14.0;
+        let mut reveal = None;
+        TableBuilder::new(ui)
+            .striped(true)
+            .resizable(true)
+            .cell_layout(Layout::left_to_right(Align::Center))
+            .column(Column::exact(26.0))
+            .column(Column::remainder().at_least(260.0).clip(true))
+            .column(Column::initial(140.0).at_least(90.0))
+            .column(Column::exact(78.0))
+            .column(Column::initial(150.0).at_least(120.0))
+            .column(Column::exact(34.0))
+            .header(22.0, |mut header| {
+                header.col(|_| {});
+                header.col(|ui| {
+                    ui.strong("Item");
+                });
+                header.col(|ui| {
+                    ui.strong("Category");
+                });
+                header.col(|ui| {
+                    ui.strong("Risk");
+                });
+                header.col(|ui| {
+                    ui.strong("Size");
+                });
+                header.col(|_| {});
+            })
+            .body(|body| {
+                body.rows(row_height, visible.len(), |mut row| {
+                    let f = &self.findings[visible[row.index()]];
+                    row.col(|ui| {
+                        let mut checked = self.selected.contains(&f.id);
+                        let enabled = f.is_actionable() && !busy;
+                        let response = ui.add_enabled(enabled, egui::Checkbox::without_text(&mut checked));
+                        let label = format!("Select {}", f.title);
+                        response
+                            .widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, checked, &label));
+                        if response.changed() {
+                            if checked {
+                                self.selected.insert(f.id.clone());
+                            } else {
+                                self.selected.remove(&f.id);
+                            }
+                        }
+                    });
+                    row.col(|ui| item_cell(ui, f, &self.home));
+                    row.col(|ui| {
+                        ui.label(f.category.label());
+                    });
+                    row.col(|ui| risk_cell(ui, f));
+                    row.col(|ui| size_cell(ui, f, max_bytes));
+                    row.col(|ui| {
+                        if let Some(path) = &f.path
+                            && ui.small_button(ICON_REVEAL).on_hover_text("Reveal in file manager").clicked()
+                        {
+                            reveal = Some(path.clone());
+                        }
+                    });
+                });
+            });
+        if let Some(path) = reveal {
+            let target = if path.exists() { path } else { path.parent().map(PathBuf::from).unwrap_or(path) };
+            if let Err(e) = opener::reveal(&target) {
+                self.log(false, format!("Could not reveal {}: {e}", target.display()));
+            }
+        }
+    }
+
+    fn confirm_modal(&mut self, ctx: &egui::Context) {
+        let chosen: Vec<&Finding> = self.findings.iter().filter(|f| self.selected.contains(&f.id)).collect();
+        let total: u64 = chosen.iter().map(|f| f.bytes_or_zero()).sum();
+        let review = chosen.iter().filter(|f| f.risk == Risk::Review).count();
+        let admin = chosen.iter().filter(|f| f.privilege == Privilege::Admin).count();
+        let unknown = chosen.iter().filter(|f| f.bytes.is_none()).count();
+        let mut confirmed = false;
+        let mut cancelled = false;
+        let modal = egui::Modal::new(egui::Id::unique("confirm-clean")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.heading(format!("Clean {}?", format::items(chosen.len())));
+            ui.add_space(6.0);
+            let mut size = format!("About {} will be reclaimed", format::bytes(total));
+            if unknown > 0 {
+                let _ = write!(size, " (plus {} of unknown size)", format::items(unknown));
+            }
+            ui.label(size);
+            ui.add_space(6.0);
+            match self.mode {
+                DeleteMode::Trash => ui.label(
+                    "Files are moved to the Trash. Space is reclaimed when the Trash is emptied. \
+                     Docker, Homebrew and other tool cleanups run their own commands and cannot be undone.",
+                ),
+                DeleteMode::Permanent => {
+                    ui.label(RichText::new("Files are deleted permanently. This cannot be undone.").color(DANGER))
+                }
+            };
+            if review > 0 {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!(
+                        "{ICON_WARN} {} marked Review and may contain data you want to keep.",
+                        format::items_are(review)
+                    ))
+                    .color(REVIEW),
+                );
+            }
+            if admin > 0 {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!(
+                        "{ICON_LOCK} {} administrator access. You will be asked for your password; \
+                         these are always removed permanently.",
+                        if admin == 1 { "1 item needs".to_owned() } else { format!("{admin} items need") }
+                    ))
+                    .color(ADMIN),
+                );
+            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let label = match self.mode {
+                    DeleteMode::Trash => format!("Clean {}", format::items(chosen.len())),
+                    DeleteMode::Permanent => format!("Delete {} permanently", format::items(chosen.len())),
+                };
+                if ui.add(egui::Button::new(RichText::new(label).strong()).fill(DANGER)).clicked() {
+                    confirmed = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancelled = true;
+                }
+            });
+        });
+        if confirmed {
+            self.confirm_open = false;
+            self.start_clean();
+        } else if cancelled || modal.should_close() {
+            self.confirm_open = false;
+        }
+    }
+}
+
+impl eframe::App for DiskdustApp {
+    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.drain_messages();
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
+        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        egui::Panel::left("sidebar").resizable(false).exact_size(240.0).show(ui, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| self.sidebar(ui));
+        });
+        egui::CentralPanel::default().show(ui, |ui| {
+            if matches!(self.phase, Phase::Welcome) {
+                self.welcome(ui);
+            } else {
+                self.table(ui);
+            }
+        });
+        if self.confirm_open {
+            let ctx = ui.ctx().clone();
+            self.confirm_modal(&ctx);
+        }
+    }
+}
+
+fn clean_summary(t: &CleanTally) -> String {
+    let mut status = format!("Cleaned {}, freed {}", format::items(t.ok), format::bytes(t.freed));
+    if t.trashed > 0 {
+        let _ = write!(status, " · {} moved to Trash (empty the Trash to reclaim it)", format::bytes(t.trashed));
+    }
+    if t.failed > 0 {
+        let _ = write!(status, " · {} failed (see Activity)", t.failed);
+    }
+    status
+}
+
+fn configure_style(ctx: &egui::Context) {
+    ctx.set_visuals(visuals());
+    ctx.all_styles_mut(|style| {
+        style.spacing.item_spacing = vec2(8.0, 6.0);
+        style.spacing.button_padding = vec2(10.0, 5.0);
+    });
+}
+
+fn visuals() -> egui::Visuals {
+    let mut v = egui::Visuals::dark();
+    v.panel_fill = BG;
+    v.window_fill = SURFACE;
+    v.window_stroke = egui::Stroke::new(1.0, BORDER);
+    v.extreme_bg_color = SURFACE;
+    v.faint_bg_color = SURFACE_STRIPE;
+    v.code_bg_color = SURFACE;
+    v.selection.bg_fill = ACCENT;
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, BORDER);
+    v
+}
+
+/// Item count and reclaimable size of a group of findings. Informational findings are counted
+/// but never contribute bytes, since they cannot be cleaned.
+#[derive(Debug, Default, Clone, Copy)]
+struct Totals {
+    count: usize,
+    bytes: u64,
+    unknown: bool,
+}
+
+impl Totals {
+    fn add(&mut self, f: &Finding) {
+        self.count += 1;
+        if f.is_actionable() {
+            match f.bytes {
+                Some(b) => self.bytes += b,
+                None => self.unknown = true,
+            }
+        }
+    }
+
+    fn label(&self) -> String {
+        format::reclaimable(self.bytes, self.unknown)
+    }
+}
+
+fn category_row(ui: &mut egui::Ui, current: &mut Option<Category>, value: Option<Category>, label: &str, t: &Totals) {
+    let selected = *current == value;
+    let text = RichText::new(format!("{label}  ({})", t.count));
+    let response = ui.horizontal(|ui| {
+        let r = ui.selectable_label(selected, if selected { text.strong() } else { text });
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(RichText::new(t.label()).weak());
+        });
+        r
+    });
+    if response.inner.clicked() {
+        *current = value;
+    }
+}
+
+fn item_cell(ui: &mut egui::Ui, f: &Finding, home: &std::path::Path) {
+    ui.vertical(|ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(&f.title).strong());
+            if f.privilege == Privilege::Admin {
+                ui.label(RichText::new(format!("{ICON_LOCK} admin")).small().color(ADMIN))
+                    .on_hover_text("Requires your administrator password when cleaned");
+            }
+        });
+        let second =
+            f.path.as_ref().map_or_else(|| f.detail.clone(), |p| format!("{} — {}", display_path(p, home), f.detail));
+        ui.label(RichText::new(second).small().weak()).on_hover_text(&f.detail);
+    });
+}
+
+fn risk_cell(ui: &mut egui::Ui, f: &Finding) {
+    let (text, color) = if !f.is_actionable() {
+        ("Info", INFO)
+    } else if f.risk == Risk::Safe {
+        ("Safe", SAFE)
+    } else {
+        ("Review", REVIEW)
+    };
+    badge(ui, text, color);
+}
+
+fn size_cell(ui: &mut egui::Ui, f: &Finding, max_bytes: u64) {
+    ui.vertical(|ui| {
+        ui.label(format::maybe_bytes(f.bytes));
+        if let (true, Some(bytes)) = (f.is_actionable(), f.bytes) {
+            #[allow(clippy::cast_precision_loss)]
+            size_bar(ui, bytes as f32 / max_bytes as f32);
+        }
+    });
+}
+
+fn badge(ui: &mut egui::Ui, text: &str, color: Color32) {
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), egui::FontId::proportional(12.5), color);
+    let (rect, response) = ui.allocate_exact_size(galley.size() + vec2(18.0, 8.0), Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 9.0, color.gamma_multiply(0.16));
+    painter.rect_stroke(rect, 9.0, egui::Stroke::new(1.0, color), egui::StrokeKind::Inside);
+    painter.galley(rect.center() - galley.size() / 2.0, galley, color);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, text));
+}
+
+fn size_bar(ui: &mut egui::Ui, fraction: f32) {
+    let width = ui.available_width().min(140.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 5.0), Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 2.0, ui.visuals().widgets.inactive.bg_fill);
+    let mut filled = rect;
+    filled.set_width((width * fraction.clamp(0.0, 1.0)).max(2.0));
+    painter.rect_filled(filled, 2.0, ACCENT);
+}
+
+/// Shows paths under home as `~/…`.
+fn display_path(path: &std::path::Path, home: &std::path::Path) -> String {
+    path.strip_prefix(home).map_or_else(|_| path.display().to_string(), |rel| format!("~/{}", rel.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn clean_summary_mentions_trash_and_failures() {
+        let t = CleanTally { freed: 2_000_000_000, trashed: 0, ok: 3, failed: 0 };
+        assert_eq!(clean_summary(&t), "Cleaned 3 items, freed 2.0 GB");
+        let t = CleanTally { freed: 0, trashed: 5_000_000, ok: 1, failed: 2 };
+        assert_eq!(
+            clean_summary(&t),
+            "Cleaned 1 item, freed 0 B · 5.0 MB moved to Trash (empty the Trash to reclaim it) · 2 failed (see Activity)"
+        );
+    }
+
+    #[test]
+    fn display_path_abbreviates_home() {
+        assert_eq!(display_path(Path::new("/Users/a/Library/Caches"), Path::new("/Users/a")), "~/Library/Caches");
+        assert_eq!(display_path(Path::new("/Library/Caches"), Path::new("/Users/a")), "/Library/Caches");
+    }
+
+    mod ui {
+        use super::super::*;
+        use diskdust_core::model::{CleanupAction, KnownCommand, SPECIFIC};
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::Queryable;
+        use std::path::Path;
+        use std::time::Duration;
+
+        fn harness(home: &Path) -> Harness<'static, DiskdustApp> {
+            let home = home.to_path_buf();
+            Harness::builder()
+                .with_size(vec2(1200.0, 760.0))
+                .build_eframe(move |cc| DiskdustApp::new(cc, Os::current().expect("supported os"), home))
+        }
+
+        fn finding(id: &str, title: &str, bytes: Option<u64>, risk: Risk, privilege: Privilege) -> Finding {
+            Finding {
+                id: id.into(),
+                scanner: "test".into(),
+                category: Category::DeveloperCaches,
+                title: title.into(),
+                detail: "Example detail text.".into(),
+                path: None,
+                bytes,
+                risk,
+                privilege,
+                action: Some(CleanupAction::Run(KnownCommand::BrewCleanup)),
+                specificity: SPECIFIC,
+            }
+        }
+
+        fn sample() -> Vec<Finding> {
+            let mut info =
+                finding("raw", "Docker Desktop disk image", Some(64_400_000_000), Risk::Safe, Privilege::User);
+            info.category = Category::Containers;
+            info.action = None;
+            let mut images =
+                finding("images", "Unused Docker images", Some(32_300_000_000), Risk::Review, Privilege::User);
+            images.category = Category::Containers;
+            let mut snapshots = finding("tm", "Time Machine local snapshots", None, Risk::Review, Privilege::Admin);
+            snapshots.category = Category::System;
+            vec![
+                info,
+                images,
+                finding("gobuild", "Go build cache", Some(18_800_000_000), Risk::Safe, Privilege::User),
+                finding("brew", "Homebrew cache", Some(1_800_000_000), Risk::Safe, Privilege::User),
+                snapshots,
+            ]
+        }
+
+        /// When `DISKDUST_SCREENSHOTS` is set, renders the frame (needs a GPU or software rasterizer)
+        /// and saves it under `<target dir>/screenshots` for visual review. Otherwise the UI tests
+        /// run headless with no renderer, so they work on any CI machine.
+        fn save(harness: &mut Harness<'_, DiskdustApp>, name: &str) {
+            if std::env::var_os("DISKDUST_SCREENSHOTS").is_none() {
+                return;
+            }
+            let target = std::env::var_os("CARGO_TARGET_DIR")
+                .map_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target"), PathBuf::from);
+            let dir = target.join("screenshots");
+            let image = harness.render().expect("render frame");
+            std::fs::create_dir_all(&dir).expect("create screenshot dir");
+            image.save(dir.join(format!("{name}.png"))).expect("save png");
+        }
+
+        fn wait_until_idle(harness: &mut Harness<'_, DiskdustApp>) {
+            for _ in 0..500 {
+                harness.step();
+                if !harness.state().busy() {
+                    harness.run_steps(2);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("app did not become idle");
+        }
+
+        #[test]
+        fn welcome_screen() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let mut harness = harness(home.path());
+            harness.run();
+            let label = if cfg!(target_os = "macos") { "Scan this Mac" } else { "Scan this computer" };
+            harness.get_by_label(label);
+            harness.get_by_label("Clean selected");
+            save(&mut harness, "welcome");
+        }
+
+        #[test]
+        fn results_table_and_selection() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let mut harness = harness(home.path());
+            harness.state_mut().findings = sample();
+            harness.state_mut().phase = Phase::Idle;
+            harness.run();
+            harness.get_by_label("Unused Docker images");
+            harness.get_by_label("Time Machine local snapshots");
+            harness.get_by_label("Select safe").click();
+            harness.run();
+            let selected = &harness.state().selected;
+            assert!(selected.contains("gobuild") && selected.contains("brew"));
+            assert!(!selected.contains("images"), "Review items must not be auto-selected");
+            assert!(!selected.contains("raw"), "informational items are not selectable");
+            harness.get_by_label("Clean 2 · 20.6 GB");
+            save(&mut harness, "results");
+        }
+
+        #[test]
+        fn confirm_modal_warns_and_cancels() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let mut harness = harness(home.path());
+            harness.state_mut().findings = sample();
+            harness.state_mut().phase = Phase::Idle;
+            harness.state_mut().selected = ["images".to_owned(), "tm".to_owned()].into();
+            harness.run();
+            harness.get_by_label("Clean 2 · 32.3 GB").click();
+            harness.run();
+            harness.get_by_label("Clean 2 items?");
+            harness.get_by_label_contains("2 items are marked Review");
+            harness.get_by_label_contains("1 item needs administrator access");
+            save(&mut harness, "confirm");
+            harness.get_by_label("Cancel").click();
+            harness.run();
+            assert!(!harness.state().confirm_open);
+            assert_eq!(harness.state().findings.len(), 5, "cancel must not remove anything");
+        }
+
+        #[test]
+        fn all_icons_have_glyphs() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let mut harness = harness(home.path());
+            harness.run();
+            let font = egui::FontId::proportional(14.0);
+            for icon in ALL_ICONS {
+                assert!(harness.ctx.fonts_mut(|f| f.has_glyphs(&font, icon)), "missing glyph for {icon:?}");
+            }
+        }
+
+        #[test]
+        fn background_is_black() {
+            let v = visuals();
+            assert_eq!(v.panel_fill, Color32::BLACK);
+            assert_ne!(v.extreme_bg_color, Color32::BLACK, "inputs must stand out from the background");
+            assert_ne!(v.faint_bg_color, Color32::BLACK, "striped rows must stay visible");
+        }
+
+        #[test]
+        fn select_all_selects_every_actionable_visible_item() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let mut harness = harness(home.path());
+            harness.state_mut().findings = sample();
+            harness.state_mut().phase = Phase::Idle;
+            harness.run();
+            harness.get_by_label("Select all").click();
+            harness.run();
+            let selected = &harness.state().selected;
+            assert_eq!(selected.len(), 4);
+            assert!(!selected.contains("raw"), "informational items are not selectable");
+            harness.get_by_label("Clear").click();
+            harness.run();
+            assert!(harness.state().selected.is_empty());
+            harness.state_mut().category = Some(Category::Containers);
+            harness.run();
+            harness.get_by_label("Select all").click();
+            harness.run();
+            assert_eq!(harness.state().selected, ["images".to_owned()].into(), "respects the category filter");
+        }
+
+        #[test]
+        fn totals_exclude_informational_items_and_flag_unknown_sizes() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let mut harness = harness(home.path());
+            harness.state_mut().findings = sample();
+            harness.state_mut().phase = Phase::Idle;
+            harness.run();
+            harness.get_by_label("52.9 GB+");
+            harness.get_by_label("5 items · 52.9 GB+ reclaimable");
+            // Containers: only the 32.3 GB of images, not the 64.4 GB info-only disk image.
+            assert_eq!(harness.query_all_by_label("32.3 GB").count(), 2, "sidebar total + table row");
+            assert!(harness.query_by_label("96.7 GB").is_none());
+            assert!(harness.query_by_label("117 GB").is_none());
+            // System holds only the snapshots, whose size is unknown: sidebar + table row.
+            assert_eq!(harness.query_all_by_label("size unknown").count(), 2);
+        }
+
+        #[test]
+        fn project_folders_and_activity_render() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let code = home.path().join("code");
+            std::fs::create_dir_all(&code).expect("mkdir");
+            let mut harness = harness(home.path());
+            harness.state_mut().project_roots = vec![code];
+            harness.state_mut().log(true, "Go build cache — Done".to_owned());
+            harness.state_mut().log(false, "Stale — permission denied".to_owned());
+            harness.run();
+            harness.get_by_label("Activity (2)").click();
+            harness.run();
+            harness.get_by_label_contains("permission denied");
+            harness.get_by_label(ICON_REMOVE).click();
+            harness.run();
+            assert!(harness.state().project_roots.is_empty());
+            save(&mut harness, "activity");
+        }
+
+        #[test]
+        fn clean_counts_every_item() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let home_path = home.path().canonicalize().expect("canonical");
+            let root = home_path.join("cache");
+            let mut items = Vec::new();
+            for name in ["a", "b", "c"] {
+                let dir = root.join(name);
+                std::fs::create_dir_all(&dir).expect("mkdir");
+                std::fs::write(dir.join("blob"), vec![0u8; 1000]).expect("write");
+                let mut item = finding(name, name, Some(1000), Risk::Safe, Privilege::User);
+                item.path = Some(dir.clone());
+                item.action = Some(CleanupAction::RemovePath { path: dir, root: root.clone() });
+                items.push(item);
+            }
+            let mut harness = harness(&home_path);
+            harness.state_mut().findings = items;
+            harness.state_mut().phase = Phase::Idle;
+            harness.state_mut().mode = DeleteMode::Permanent;
+            harness.run();
+            harness.get_by_label("Select all").click();
+            harness.run();
+            harness.get_by_label_contains("Clean 3").click();
+            harness.run();
+            harness.get_by_label("Delete 3 items permanently").click();
+            wait_until_idle(&mut harness);
+            assert_eq!(harness.state().status, "Cleaned 3 items, freed 3.0 kB");
+            assert_eq!(std::fs::read_dir(&root).expect("read").count(), 0);
+        }
+
+        #[test]
+        fn clean_flow_deletes_selected_item_and_logs_it() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let home_path = home.path().canonicalize().expect("canonical");
+            let target = home_path.join("cache/stale");
+            std::fs::create_dir_all(&target).expect("mkdir");
+            std::fs::write(target.join("blob"), vec![0u8; 4096]).expect("write");
+            let mut item = finding("stale", "Stale cache", Some(4096), Risk::Safe, Privilege::User);
+            item.path = Some(target.clone());
+            item.action = Some(CleanupAction::RemovePath { path: target.clone(), root: home_path.join("cache") });
+            let mut harness = harness(&home_path);
+            harness.state_mut().findings = vec![item];
+            harness.state_mut().phase = Phase::Idle;
+            harness.state_mut().selected = ["stale".to_owned()].into();
+            harness.run();
+            harness.get_by_label("Delete permanently").click();
+            harness.run();
+            harness.get_by_label_contains("Clean 1").click();
+            harness.run();
+            harness.get_by_label_contains("cannot be undone");
+            harness.get_by_label("Delete 1 item permanently").click();
+            wait_until_idle(&mut harness);
+            assert!(!target.exists(), "selected item must be removed");
+            assert!(home_path.join("cache").exists(), "its parent must remain");
+            assert!(harness.state().findings.is_empty());
+            assert_eq!(harness.state().status, "Cleaned 1 item, freed 4.1 kB");
+            let log = match Os::current().expect("os") {
+                Os::MacOs => home_path.join("Library/Logs/diskdust/cleanup.jsonl"),
+                Os::Linux => home_path.join(".local/state/diskdust/cleanup.jsonl"),
+            };
+            let text = std::fs::read_to_string(log).expect("audit log written");
+            assert!(text.contains("\"ok\":true") && text.contains("Stale cache"));
+            save(&mut harness, "after-clean");
+        }
+    }
+}
