@@ -18,9 +18,11 @@ Download the file for your system from the
 | Debian / Ubuntu | `diskdust_<version>_amd64.deb` / `_arm64.deb` | `sudo apt install ./diskdust_<version>_amd64.deb` |
 | Other Linux | `diskdust_<version>_x86_64.AppImage` / `_aarch64.AppImage` | `chmod +x` it and run it |
 
-The macOS app is signed ad hoc but not notarized yet, so the first launch says it "cannot be
-verified": right-click the app → **Open** (once), or run
-`xattr -d com.apple.quarantine /Applications/diskdust.app`.
+The macOS app is signed ad hoc but not notarized yet, so macOS blocks the first launch ("cannot
+verify … is free of malware"). Once per version, either open it, click **Done**, then go to
+**System Settings → Privacy & Security → Open Anyway**; or run
+`xattr -d com.apple.quarantine /Applications/diskdust.app` and open it normally. (Right-click →
+**Open** no longer bypasses this check since macOS 15.)
 
 Each release lists `SHA256SUMS` and carries signed build provenance:
 `sha256sum -c SHA256SUMS --ignore-missing` and
