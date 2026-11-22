@@ -9,7 +9,7 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::Instant;
 
 use diskdust_core::clean::DeleteMode;
-use diskdust_core::model::{Category, Finding, Os, Privilege, Risk};
+use diskdust_core::model::{Category, CleanupAction, Finding, Os, Privilege, Risk};
 use diskdust_core::scan::ScanEvent;
 use diskdust_core::scanners::{default_project_roots, unique_dirs};
 use egui::{Align, Color32, Layout, RichText, Sense, vec2};
@@ -130,6 +130,8 @@ impl DiskdustApp {
     }
 
     fn start_scan(&mut self) {
+        // Sizes and items change between scans; never carry a stale selection into a new one.
+        self.selected.clear();
         self.cancel = Arc::new(AtomicBool::new(false));
         self.phase = Phase::Scanning { started: Instant::now(), running: Vec::new(), finished: 0 };
         "Scanning…".clone_into(&mut self.status);
@@ -409,6 +411,10 @@ impl DiskdustApp {
                 )
                 .weak(),
             );
+            if let Some(note) = privacy_prompt_note(self.os, &self.home, &self.project_roots) {
+                ui.add_space(8.0);
+                ui.label(RichText::new(note).small().color(INFO));
+            }
             ui.add_space(18.0);
             let label = match self.os {
                 Os::MacOs => "Scan this Mac",
@@ -536,6 +542,8 @@ impl DiskdustApp {
         let review = chosen.iter().filter(|f| f.risk == Risk::Review).count();
         let admin = chosen.iter().filter(|f| f.privilege == Privilege::Admin).count();
         let unknown = chosen.iter().filter(|f| f.bytes.is_none()).count();
+        let permanent: Vec<&str> =
+            chosen.iter().filter(|f| removed_permanently_in_trash_mode(f)).map(|f| f.title.as_str()).collect();
         let mut confirmed = false;
         let mut cancelled = false;
         let modal = egui::Modal::new(egui::Id::unique("confirm-clean")).show(ctx, |ui| {
@@ -549,14 +557,17 @@ impl DiskdustApp {
             ui.label(size);
             ui.add_space(6.0);
             match self.mode {
-                DeleteMode::Trash => ui.label(
-                    "Files are moved to the Trash. Space is reclaimed when the Trash is emptied. \
-                     Docker, Homebrew and other tool cleanups run their own commands and cannot be undone.",
-                ),
-                DeleteMode::Permanent => {
-                    ui.label(RichText::new("Files are deleted permanently. This cannot be undone.").color(DANGER))
+                DeleteMode::Trash => {
+                    ui.label("Files are moved to the Trash. Space is reclaimed when the Trash is emptied.");
+                    if !permanent.is_empty() {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(permanent_warning(&permanent)).color(DANGER));
+                    }
                 }
-            };
+                DeleteMode::Permanent => {
+                    ui.label(RichText::new("Files are deleted permanently. This cannot be undone.").color(DANGER));
+                }
+            }
             if review > 0 {
                 ui.add_space(6.0);
                 ui.label(
@@ -624,6 +635,44 @@ impl eframe::App for DiskdustApp {
             self.confirm_modal(&ctx);
         }
     }
+}
+
+/// Items that bypass the Trash even in Trash mode: emptying a trash folder, tool commands
+/// (Docker, Homebrew, …) and admin items run by the privileged helper.
+fn removed_permanently_in_trash_mode(f: &Finding) -> bool {
+    f.privilege == Privilege::Admin || !matches!(f.action, Some(CleanupAction::RemovePath { .. }))
+}
+
+/// "2 items are removed permanently, not moved to the Trash: A, B." (at most 4 names).
+fn permanent_warning(titles: &[&str]) -> String {
+    const SHOWN: usize = 4;
+    let mut names = titles.iter().take(SHOWN).copied().collect::<Vec<_>>().join(", ");
+    if titles.len() > SHOWN {
+        let _ = write!(names, " and {} more", titles.len() - SHOWN);
+    }
+    format!(
+        "{ICON_WARN} {} removed permanently, not moved to the Trash: {names}. This cannot be undone.",
+        format::items_are(titles.len())
+    )
+}
+
+/// macOS asks before an app reads Documents, Desktop or Downloads. Explain the prompt up front when
+/// a default project folder lives there.
+fn privacy_prompt_note(os: Os, home: &std::path::Path, roots: &[PathBuf]) -> Option<String> {
+    if os != Os::MacOs {
+        return None;
+    }
+    let protected: Vec<&str> = ["Documents", "Desktop", "Downloads"]
+        .into_iter()
+        .filter(|name| roots.iter().any(|r| r.starts_with(home.join(name))))
+        .collect();
+    (!protected.is_empty()).then(|| {
+        format!(
+            "macOS may ask to let diskdust access your {} folder: it looks for build output (target/, \
+             node_modules/, …) in project folders there. Remove the folder under Project folders to skip it.",
+            protected.join(" and ")
+        )
+    })
 }
 
 fn clean_summary(t: &CleanTally) -> String {
@@ -776,6 +825,43 @@ mod tests {
     }
 
     #[test]
+    fn permanent_items_in_trash_mode() {
+        let mut f = Finding {
+            id: "x".into(),
+            scanner: "t".into(),
+            category: Category::Trash,
+            title: "x".into(),
+            detail: String::new(),
+            path: None,
+            bytes: None,
+            risk: Risk::Safe,
+            privilege: Privilege::User,
+            action: Some(CleanupAction::RemovePath { path: "/a/b".into(), root: "/a".into() }),
+            specificity: 0,
+        };
+        assert!(!removed_permanently_in_trash_mode(&f));
+        f.privilege = Privilege::Admin;
+        assert!(removed_permanently_in_trash_mode(&f), "the helper always deletes permanently");
+        f.privilege = Privilege::User;
+        f.action = Some(CleanupAction::EmptyDir { path: "/a/b".into(), root: "/a".into() });
+        assert!(removed_permanently_in_trash_mode(&f));
+        assert_eq!(
+            permanent_warning(&["Trash"]),
+            format!("{ICON_WARN} 1 item is removed permanently, not moved to the Trash: Trash. This cannot be undone.")
+        );
+        assert!(permanent_warning(&["a", "b", "c", "d", "e", "f"]).contains("a, b, c, d and 2 more"));
+    }
+
+    #[test]
+    fn privacy_note_only_for_protected_mac_folders() {
+        let home = Path::new("/Users/a");
+        let docs = vec![PathBuf::from("/Users/a/Documents"), PathBuf::from("/Users/a/code")];
+        assert!(privacy_prompt_note(Os::MacOs, home, &docs).expect("note").contains("your Documents folder"));
+        assert!(privacy_prompt_note(Os::Linux, home, &docs).is_none());
+        assert!(privacy_prompt_note(Os::MacOs, home, &[PathBuf::from("/Users/a/code")]).is_none());
+    }
+
+    #[test]
     fn display_path_abbreviates_home() {
         assert_eq!(display_path(Path::new("/Users/a/Library/Caches"), Path::new("/Users/a")), "~/Library/Caches");
         assert_eq!(display_path(Path::new("/Library/Caches"), Path::new("/Users/a")), "/Library/Caches");
@@ -901,11 +987,27 @@ mod tests {
             harness.get_by_label("Clean 2 items?");
             harness.get_by_label_contains("2 items are marked Review");
             harness.get_by_label_contains("1 item needs administrator access");
+            harness.get_by_label_contains("2 items are removed permanently, not moved to the Trash");
             save(&mut harness, "confirm");
             harness.get_by_label("Cancel").click();
             harness.run();
             assert!(!harness.state().confirm_open);
             assert_eq!(harness.state().findings.len(), 5, "cancel must not remove anything");
+        }
+
+        #[test]
+        fn rescan_clears_selection() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let mut harness = harness(home.path());
+            harness.state_mut().findings = sample();
+            harness.state_mut().phase = Phase::Idle;
+            harness.state_mut().selected = ["images".to_owned()].into();
+            harness.run();
+            harness.get_by_label("Rescan").click();
+            harness.step();
+            assert!(harness.state().selected.is_empty());
+            harness.state().cancel.store(true, Ordering::Relaxed);
+            wait_until_idle(&mut harness);
         }
 
         #[test]
@@ -1041,11 +1143,13 @@ mod tests {
             assert!(home_path.join("cache").exists(), "its parent must remain");
             assert!(harness.state().findings.is_empty());
             assert_eq!(harness.state().status, "Cleaned 1 item, freed 4.1 kB");
-            let log = match Os::current().expect("os") {
-                Os::MacOs => home_path.join("Library/Logs/diskdust/cleanup.jsonl"),
-                Os::Linux => home_path.join(".local/state/diskdust/cleanup.jsonl"),
-            };
-            let text = std::fs::read_to_string(log).expect("audit log written");
+            // Same resolution as the worker, so the test also passes when XDG_STATE_HOME is set.
+            let log = diskdust_core::audit::AuditLog::default_location(
+                &home_path,
+                Os::current().expect("os"),
+                std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
+            );
+            let text = std::fs::read_to_string(log.path()).expect("audit log written");
             assert!(text.contains("\"ok\":true") && text.contains("Stale cache"));
             save(&mut harness, "after-clean");
         }
