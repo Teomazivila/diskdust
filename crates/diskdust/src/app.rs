@@ -226,26 +226,36 @@ impl DiskdustApp {
     fn history_window(&mut self, ctx: &egui::Context) {
         let Some(entries) = &self.history else { return };
         let mut open = true;
-        egui::Window::new("Cleanup history").open(&mut open).default_size(vec2(720.0, 420.0)).show(ctx, |ui| {
-            if entries.is_empty() {
-                ui.label(RichText::new("Nothing has been cleaned yet.").weak());
-                return;
-            }
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                egui::Grid::new("history-grid").striped(true).num_columns(4).spacing(vec2(12.0, 4.0)).show(ui, |ui| {
-                    for e in entries {
-                        ui.label(
-                            RichText::new(e.timestamp.get(..16).unwrap_or(&e.timestamp).replace('T', " ")).small(),
-                        );
-                        let (icon, color) = if e.ok { (ICON_OK, SAFE) } else { (ICON_FAIL, DANGER) };
-                        ui.label(RichText::new(icon).color(color));
-                        ui.label(&e.title).on_hover_text(&e.message);
-                        ui.label(RichText::new(format::maybe_bytes(e.bytes)).small());
-                        ui.end_row();
-                    }
+        egui::Window::new("Cleanup history")
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_TOP, vec2(0.0, 70.0))
+            .min_width(640.0)
+            .min_height(240.0)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                if entries.is_empty() {
+                    ui.label(RichText::new("Nothing has been cleaned yet.").weak());
+                    return;
+                }
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    egui::Grid::new("history-grid").striped(true).num_columns(4).spacing(vec2(12.0, 4.0)).show(
+                        ui,
+                        |ui| {
+                            for e in entries {
+                                ui.label(
+                                    RichText::new(e.timestamp.get(..16).unwrap_or(&e.timestamp).replace('T', " "))
+                                        .small(),
+                                );
+                                let (icon, color) = if e.ok { (ICON_OK, SAFE) } else { (ICON_FAIL, DANGER) };
+                                ui.label(RichText::new(icon).color(color));
+                                ui.label(&e.title).on_hover_text(&e.message);
+                                ui.label(RichText::new(format::maybe_bytes(e.bytes)).small());
+                                ui.end_row();
+                            }
+                        },
+                    );
                 });
             });
-        });
         if !open {
             self.history = None;
         }
@@ -840,19 +850,31 @@ impl DiskdustApp {
         let text_height = ui.text_style_height(&egui::TextStyle::Body);
         let row_height = text_height * 2.0 + 14.0;
         let mut actions = Vec::new();
-        TableBuilder::new(ui)
+        // With the details panel open the Category column is dropped (the panel shows it), so Size
+        // and Modified stay visible; each layout keeps its own column widths.
+        let compact = self.details.is_some();
+        let mut table = TableBuilder::new(ui)
+            .id_salt(if compact { "results-compact" } else { "results" })
             .striped(true)
             .resizable(true)
             .cell_layout(Layout::left_to_right(Align::Center))
             .column(Column::exact(26.0))
-            .column(Column::remainder().at_least(260.0).clip(true))
-            .column(Column::initial(140.0).at_least(90.0))
+            .column(Column::remainder().at_least(if compact { 180.0 } else { 260.0 }).clip(true));
+        if !compact {
+            table = table.column(Column::initial(140.0).at_least(90.0));
+        }
+        let titles: &[&str] = if compact {
+            &["", "Item", "Risk", "Size", "Modified", ""]
+        } else {
+            &["", "Item", "Category", "Risk", "Size", "Modified", ""]
+        };
+        table
             .column(Column::exact(78.0))
-            .column(Column::initial(150.0).at_least(120.0))
-            .column(Column::initial(110.0).at_least(90.0))
+            .column(Column::initial(130.0).at_least(100.0))
+            .column(Column::initial(100.0).at_least(80.0))
             .column(Column::exact(34.0))
             .header(22.0, |mut header| {
-                for title in ["", "Item", "Category", "Risk", "Size", "Modified", ""] {
+                for &title in titles {
                     header.col(|ui| {
                         ui.strong(title);
                     });
@@ -861,7 +883,7 @@ impl DiskdustApp {
             .body(|body| {
                 body.rows(row_height, visible.len(), |row| {
                     let f = &self.findings[visible[row.index()]];
-                    self.table_row(row, f, RowContext { busy, now, max_bytes }, &mut actions);
+                    self.table_row(row, f, RowContext { busy, now, max_bytes, compact }, &mut actions);
                 });
             });
         for action in actions {
@@ -894,9 +916,11 @@ impl DiskdustApp {
                 }
             });
         });
-        row.col(|ui| {
-            ui.label(f.category.label());
-        });
+        if !rc.compact {
+            row.col(|ui| {
+                ui.label(f.category.label());
+            });
+        }
         row.col(|ui| risk_cell(ui, f));
         row.col(|ui| size_cell(ui, f, rc.max_bytes));
         row.col(|ui| {
@@ -1141,6 +1165,8 @@ struct RowContext {
     busy: bool,
     now: i64,
     max_bytes: u64,
+    /// Details panel open: no Category column.
+    compact: bool,
 }
 
 /// What the user did in a table row, applied after the table is drawn.
