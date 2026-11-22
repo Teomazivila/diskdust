@@ -461,12 +461,18 @@ impl DiskdustApp {
         }
     }
 
-    fn start_scan(&mut self) {
+    /// Resets state for a new scan. Split from [`Self::start_scan`] so it can be tested without
+    /// starting a real scan of the machine.
+    fn begin_scan(&mut self) {
         // Sizes and items change between scans; never carry a stale selection into a new one.
         self.selected.clear();
         self.cancel = Arc::new(AtomicBool::new(false));
         self.phase = Phase::Scanning { started: Instant::now(), running: Vec::new(), finished: 0 };
         "Scanning…".clone_into(&mut self.status);
+    }
+
+    fn start_scan(&mut self) {
+        self.begin_scan();
         worker::spawn_scan(
             self.os,
             self.home.clone(),
@@ -1744,11 +1750,12 @@ mod tests {
             harness.state_mut().phase = Phase::Idle;
             harness.state_mut().selected = ["images".to_owned()].into();
             harness.run();
-            harness.get_by_label("Rescan").click();
-            harness.step();
+            harness.get_by_label("Rescan");
+            // Hermetic: reset state as Rescan does, without scanning the test machine (real
+            // docker / brew / xcrun calls are slow and non-deterministic on CI runners).
+            harness.state_mut().begin_scan();
             assert!(harness.state().selected.is_empty());
-            harness.state().cancel.store(true, Ordering::Relaxed);
-            wait_until_idle(&mut harness);
+            assert!(matches!(harness.state().phase, Phase::Scanning { .. }));
         }
 
         #[test]
