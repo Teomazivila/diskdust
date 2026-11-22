@@ -178,6 +178,8 @@ pub(crate) fn base_finding(scanner: &str, id: String, category: Category, title:
         privilege: Privilege::User,
         action: None,
         specificity: GENERIC,
+        last_modified: None,
+        quit_first: None,
     }
 }
 

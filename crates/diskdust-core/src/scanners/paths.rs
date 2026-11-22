@@ -538,6 +538,7 @@ impl PathRulesScanner {
             detail: with_shared_note(detail, &report),
             path: Some(path.to_path_buf()),
             bytes: Some(report.bytes),
+            last_modified: report.newest,
             risk: rule.risk,
             privilege: rule.privilege,
             action: Some(action),

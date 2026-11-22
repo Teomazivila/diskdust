@@ -42,6 +42,7 @@ fn measured_finding(
         detail: with_shared_note(detail.to_owned(), &report),
         path: Some(path),
         bytes: Some(report.bytes),
+        last_modified: report.newest,
         risk: Risk::Safe,
         action: Some(CleanupAction::Run(cmd)),
         specificity: SPECIFIC,

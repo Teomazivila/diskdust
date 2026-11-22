@@ -105,6 +105,8 @@ mod tests {
             privilege: Privilege::User,
             action: None,
             specificity,
+            last_modified: None,
+            quit_first: None,
         }
     }
 

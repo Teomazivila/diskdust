@@ -75,8 +75,10 @@ impl Scanner for OrphanedAppDataScanner {
                 if !looks_like_bundle_id(&name) || name.starts_with("com.apple.") || is_installed(&name, &installed) {
                     return None;
                 }
-                let bytes = ctx.measure(dir)?.bytes;
+                let report = ctx.measure(dir)?;
+                let bytes = report.bytes;
                 (bytes >= MIN_BYTES).then(|| Finding {
+                    last_modified: report.newest,
                     detail: "App data with no matching installed app. The app may live outside /Applications; \
                              check before removing."
                         .to_owned(),

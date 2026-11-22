@@ -193,6 +193,15 @@ pub enum CleanupAction {
     Run(KnownCommand),
 }
 
+/// An app that must not be running while its data is cleaned (e.g. Slack for its cache).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RunningApp {
+    /// Name shown to the user ("Slack").
+    pub app: String,
+    /// Arguments to `pgrep` that match the app's processes, e.g. `["-f", "Slack.app/Contents/MacOS/"]`.
+    pub pgrep: Vec<String>,
+}
+
 /// A single reclaimable item discovered by a scanner.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Finding {
@@ -215,11 +224,22 @@ pub struct Finding {
     /// Lower values win when two findings overlap on disk. Specific rules use 0, generic
     /// "every child of a cache folder" rules use 10.
     pub specificity: u8,
+    /// Newest modification time inside the item (Unix seconds), when known.
+    #[serde(default)]
+    pub last_modified: Option<i64>,
+    /// App that must be quit before cleaning; the cleaner refuses the item while it runs.
+    #[serde(default)]
+    pub quit_first: Option<RunningApp>,
 }
 
 impl Finding {
     pub const fn is_actionable(&self) -> bool {
         self.action.is_some()
+    }
+
+    /// Whole days since [`Finding::last_modified`], relative to `now` (Unix seconds).
+    pub fn age_days(&self, now: i64) -> Option<u64> {
+        self.last_modified.map(|t| u64::try_from((now - t).max(0) / 86_400).unwrap_or(0))
     }
 
     pub const fn bytes_or_zero(&self) -> u64 {
@@ -325,6 +345,8 @@ mod tests {
             privilege: Privilege::User,
             action: None,
             specificity: SPECIFIC,
+            last_modified: None,
+            quit_first: None,
         };
         assert_eq!(f.bytes_or_zero(), 0);
         assert!(!f.is_actionable());
@@ -332,5 +354,10 @@ mod tests {
         f.action = Some(CleanupAction::Run(KnownCommand::BrewCleanup));
         assert_eq!(f.bytes_or_zero(), 42);
         assert!(f.is_actionable());
+        assert_eq!(f.age_days(1_000_000), None);
+        f.last_modified = Some(1_000_000 - 3 * 86_400 - 5);
+        assert_eq!(f.age_days(1_000_000), Some(3));
+        f.last_modified = Some(2_000_000);
+        assert_eq!(f.age_days(1_000_000), Some(0), "future timestamps clamp to 0");
     }
 }

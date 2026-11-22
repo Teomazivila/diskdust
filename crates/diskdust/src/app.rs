@@ -25,6 +25,8 @@ const ADMIN: Color32 = Color32::from_rgb(100, 181, 246);
 const DANGER: Color32 = Color32::from_rgb(229, 115, 115);
 const ACCENT: Color32 = Color32::from_rgb(126, 87, 194);
 const MAX_ACTIVITY: usize = 300;
+/// Choices of the "last modified" filter, in days (`None` = any age).
+const AGE_FILTERS: [Option<u32>; 5] = [None, Some(7), Some(30), Some(90), Some(180)];
 
 // Every icon the UI draws. They must exist in the bundled fonts (see `all_icons_have_glyphs`).
 const ICON_REMOVE: &str = "×";
@@ -81,6 +83,8 @@ pub struct DiskdustApp {
     selected: HashSet<String>,
     category: Option<Category>,
     search: String,
+    /// Only show items not modified for at least this many days.
+    older_than: Option<u32>,
     mode: DeleteMode,
     project_roots: Vec<PathBuf>,
     phase: Phase,
@@ -105,6 +109,7 @@ impl DiskdustApp {
             selected: HashSet::new(),
             category: None,
             search: String::new(),
+            older_than: None,
             mode: DeleteMode::Trash,
             project_roots,
             phase: Phase::Welcome,
@@ -220,10 +225,14 @@ impl DiskdustApp {
 
     fn visible(&self) -> Vec<usize> {
         let needle = self.search.to_lowercase();
+        let now = format::now_unix();
         self.findings
             .iter()
             .enumerate()
             .filter(|(_, f)| self.category.is_none_or(|c| f.category == c))
+            .filter(|(_, f)| {
+                self.older_than.is_none_or(|days| f.age_days(now).is_some_and(|age| age >= u64::from(days)))
+            })
             .filter(|(_, f)| {
                 needle.is_empty()
                     || f.title.to_lowercase().contains(&needle)
@@ -433,6 +442,15 @@ impl DiskdustApp {
             ui.add(
                 egui::TextEdit::singleline(&mut self.search).hint_text("Filter by name or path…").desired_width(280.0),
             );
+            egui::ComboBox::from_id_salt("age-filter")
+                .selected_text(age_filter_label(self.older_than))
+                .show_ui(ui, |ui| {
+                    for choice in AGE_FILTERS {
+                        ui.selectable_value(&mut self.older_than, choice, age_filter_label(choice));
+                    }
+                })
+                .response
+                .on_hover_text("Show only items whose newest file or folder is at least this old");
             let mut shown = Totals::default();
             for i in visible {
                 shown.add(&self.findings[*i]);
@@ -466,6 +484,7 @@ impl DiskdustApp {
             .unwrap_or(1)
             .max(1);
         let busy = self.busy();
+        let now = format::now_unix();
         let text_height = ui.text_style_height(&egui::TextStyle::Body);
         let row_height = text_height * 2.0 + 14.0;
         let mut reveal = None;
@@ -478,6 +497,7 @@ impl DiskdustApp {
             .column(Column::initial(140.0).at_least(90.0))
             .column(Column::exact(78.0))
             .column(Column::initial(150.0).at_least(120.0))
+            .column(Column::initial(110.0).at_least(90.0))
             .column(Column::exact(34.0))
             .header(22.0, |mut header| {
                 header.col(|_| {});
@@ -492,6 +512,9 @@ impl DiskdustApp {
                 });
                 header.col(|ui| {
                     ui.strong("Size");
+                });
+                header.col(|ui| {
+                    ui.strong("Modified");
                 });
                 header.col(|_| {});
             })
@@ -519,6 +542,9 @@ impl DiskdustApp {
                     });
                     row.col(|ui| risk_cell(ui, f));
                     row.col(|ui| size_cell(ui, f, max_bytes));
+                    row.col(|ui| {
+                        ui.label(RichText::new(format::age(f.age_days(now))).weak());
+                    });
                     row.col(|ui| {
                         if let Some(path) = &f.path
                             && ui.small_button(ICON_REVEAL).on_hover_text("Reveal in file manager").clicked()
@@ -635,6 +661,10 @@ impl eframe::App for DiskdustApp {
             self.confirm_modal(&ctx);
         }
     }
+}
+
+fn age_filter_label(days: Option<u32>) -> String {
+    days.map_or_else(|| "Any age".to_owned(), |d| format!("Untouched {d}+ days"))
 }
 
 /// Items that bypass the Trash even in Trash mode: emptying a trash folder, tool commands
@@ -838,6 +868,8 @@ mod tests {
             privilege: Privilege::User,
             action: Some(CleanupAction::RemovePath { path: "/a/b".into(), root: "/a".into() }),
             specificity: 0,
+            last_modified: None,
+            quit_first: None,
         };
         assert!(!removed_permanently_in_trash_mode(&f));
         f.privilege = Privilege::Admin;
@@ -895,6 +927,8 @@ mod tests {
                 privilege,
                 action: Some(CleanupAction::Run(KnownCommand::BrewCleanup)),
                 specificity: SPECIFIC,
+                last_modified: None,
+                quit_first: None,
             }
         }
 
@@ -993,6 +1027,27 @@ mod tests {
             harness.run();
             assert!(!harness.state().confirm_open);
             assert_eq!(harness.state().findings.len(), 5, "cancel must not remove anything");
+        }
+
+        #[test]
+        fn age_filter_hides_recent_and_undated_items() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let mut harness = harness(home.path());
+            let now = format::now_unix();
+            let mut findings = sample();
+            findings[2].last_modified = Some(now - 40 * 86_400); // gobuild: 40 days
+            findings[3].last_modified = Some(now - 86_400); // brew: yesterday
+            harness.state_mut().findings = findings;
+            harness.state_mut().phase = Phase::Idle;
+            harness.run();
+            harness.get_by_label("40 days ago");
+            harness.get_by_label("1 day ago");
+            harness.state_mut().older_than = Some(30);
+            harness.run();
+            let visible: Vec<String> =
+                harness.state().visible().iter().map(|i| harness.state().findings[*i].id.clone()).collect();
+            assert_eq!(visible, ["gobuild"], "recent and undated items are hidden");
+            save(&mut harness, "age-filter");
         }
 
         #[test]

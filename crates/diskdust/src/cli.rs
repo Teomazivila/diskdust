@@ -87,6 +87,8 @@ mod tests {
             privilege,
             action: action.then_some(CleanupAction::Run(KnownCommand::BrewCleanup)),
             specificity: SPECIFIC,
+            last_modified: None,
+            quit_first: None,
         }
     }
 
