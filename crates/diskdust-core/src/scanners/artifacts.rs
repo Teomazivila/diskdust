@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 
-use super::{MIN_BYTES, ScanContext, ScanError, Scanner, base_finding, children, file_name, is_real_dir};
+use super::{
+    MIN_BYTES, ScanContext, ScanError, Scanner, base_finding, children, file_name, is_real_dir, with_shared_note,
+};
 use crate::model::{Category, CleanupAction, Finding, Os, Risk, SPECIFIC};
 
 /// Maximum folder depth below a project root.
@@ -126,15 +128,15 @@ impl Scanner for BuildArtifactsScanner {
         Ok(candidates
             .par_iter()
             .filter_map(|(root, path, kind)| {
-                let bytes = ctx.measure(path).bytes;
-                if bytes < MIN_BYTES {
+                let report = ctx.measure(path)?;
+                if report.bytes < MIN_BYTES {
                     return None;
                 }
                 let project = path.parent().map_or_default(file_name);
                 Some(Finding {
-                    detail: kind.detail().to_owned(),
+                    detail: with_shared_note(kind.detail().to_owned(), &report),
                     path: Some(path.clone()),
-                    bytes: Some(bytes),
+                    bytes: Some(report.bytes),
                     risk: kind.risk(),
                     action: Some(CleanupAction::RemovePath { path: path.clone(), root: root.clone() }),
                     specificity: SPECIFIC,
@@ -212,6 +214,20 @@ mod tests {
         let found = scan(&env);
         assert_eq!(found.len(), 1, "{found:#?}");
         assert_eq!(found[0].path.as_deref(), Some(env.home.join("code/web/node_modules").as_path()));
+    }
+
+    #[test]
+    fn pnpm_linked_node_modules_report_only_their_own_bytes() {
+        let env = Env::new();
+        env.file("code/web/package.json", 1);
+        env.file("code/web/node_modules/own/big", BIG);
+        let store = env.file("Library/pnpm/store/v10/files/aa/blob", BIG * 2);
+        std::fs::hard_link(&store, env.home.join("code/web/node_modules/own/linked")).expect("link");
+        let found = scan(&env);
+        assert_eq!(found.len(), 1);
+        let bytes = found[0].bytes.expect("bytes");
+        assert!(bytes >= BIG as u64 && bytes < (BIG * 2) as u64, "{bytes}");
+        assert!(found[0].detail.contains("hard-linked from elsewhere"), "{}", found[0].detail);
     }
 
     #[test]

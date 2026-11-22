@@ -1,0 +1,9 @@
+# cargo-audit configuration. Keep in sync with [advisories] in deny.toml, which records the reason
+# for each ignore (unmaintained transitive crates of egui; no vulnerability advisories).
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0192", # ttf-parser (egui fonts)
+    "RUSTSEC-2026-0370", # zvariant (zbus 5 via accesskit_unix, opener)
+    "RUSTSEC-2026-0371", # zbus_names
+    "RUSTSEC-2026-0372", # zvariant_derive
+]

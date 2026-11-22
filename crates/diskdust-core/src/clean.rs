@@ -397,6 +397,19 @@ pub(crate) mod tests {
         assert!(format!("{admin:?}").contains("allow_admin: true"));
     }
 
+    /// Exercises the real platform Trash (`NSFileManager` on macOS, freedesktop on Linux) with a
+    /// disposable file. Ignored by default because it leaves that file in the user's Trash:
+    /// `cargo test -p diskdust-core -- --ignored system_trash`.
+    #[test]
+    #[ignore = "moves a disposable file into the user's real Trash"]
+    fn system_trash_moves_a_real_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join(format!("diskdust-trash-check-{}.txt", std::process::id()));
+        fs::write(&file, b"diskdust Trash verification; safe to delete").expect("write");
+        SystemTrash.trash(&file).expect("moved to Trash");
+        assert!(!file.exists(), "file must leave its folder");
+    }
+
     #[test]
     fn tail_truncates_by_chars() {
         assert_eq!(tail("  short  ", 10), "short");

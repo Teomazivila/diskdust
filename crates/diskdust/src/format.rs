@@ -4,21 +4,7 @@ use std::time::Duration;
 
 /// Formats bytes with decimal (SI) units, matching how macOS Finder and Docker report sizes.
 pub fn bytes(n: u64) -> String {
-    const UNITS: [&str; 5] = ["kB", "MB", "GB", "TB", "PB"];
-    if n < 1000 {
-        return format!("{n} B");
-    }
-    #[allow(clippy::cast_precision_loss)]
-    let mut value = n as f64;
-    let mut unit = "B";
-    for next in UNITS {
-        if value < 1000.0 {
-            break;
-        }
-        value /= 1000.0;
-        unit = next;
-    }
-    if value >= 100.0 { format!("{value:.0} {unit}") } else { format!("{value:.1} {unit}") }
+    diskdust_core::units::format_bytes(n)
 }
 
 /// Formats an optional size, using "size unknown" when absent.

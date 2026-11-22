@@ -1,0 +1,5 @@
+# Must match `rust-version` in Cargo.toml and the toolchain used by CI.
+[toolchain]
+channel = "1.100"
+components = ["rustfmt", "clippy", "llvm-tools"]
+profile = "minimal"

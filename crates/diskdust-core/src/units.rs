@@ -50,6 +50,25 @@ pub fn parse_journal_usage(output: &str) -> Option<u64> {
     to_bytes(number, multiplier)
 }
 
+/// Formats bytes with decimal (SI) units, matching how macOS Finder and Docker report sizes.
+pub fn format_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["kB", "MB", "GB", "TB", "PB"];
+    if n < 1000 {
+        return format!("{n} B");
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let mut value = n as f64;
+    let mut unit = "B";
+    for next in UNITS {
+        if value < 1000.0 {
+            break;
+        }
+        value /= 1000.0;
+        unit = next;
+    }
+    if value >= 100.0 { format!("{value:.0} {unit}") } else { format!("{value:.1} {unit}") }
+}
+
 fn to_bytes(number: &str, multiplier: u64) -> Option<u64> {
     let parsed: f64 = number.parse().ok()?;
     if !parsed.is_finite() || parsed < 0.0 {
@@ -118,6 +137,18 @@ mod tests {
         assert_eq!(parse_journal_usage("No journal files were found."), None);
         assert_eq!(parse_journal_usage("take up 1.5Q in"), None);
         assert_eq!(parse_journal_usage("take up"), None);
+    }
+
+    #[test]
+    fn formats_bytes() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(999), "999 B");
+        assert_eq!(format_bytes(1_000), "1.0 kB");
+        assert_eq!(format_bytes(1_536_000), "1.5 MB");
+        assert_eq!(format_bytes(31_300_000_000), "31.3 GB");
+        assert_eq!(format_bytes(250_000_000_000), "250 GB");
+        assert_eq!(format_bytes(1_200_000_000_000), "1.2 TB");
+        assert_eq!(format_bytes(u64::MAX), "18447 PB");
     }
 
     #[test]

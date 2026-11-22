@@ -1,10 +1,13 @@
 //! Table-driven scanner for well-known cache, log and data locations.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 
-use super::{MIN_BYTES, ScanContext, ScanError, Scanner, base_finding, children, file_name, is_real_dir};
+use super::{
+    MIN_BYTES, ScanContext, ScanError, Scanner, base_finding, children, file_name, is_real_dir, with_shared_note,
+};
 use crate::model::{Category, CleanupAction, Finding, GENERIC, KnownCommand, Os, Privilege, Risk, SPECIFIC};
 
 /// Where a rule's relative path is anchored.
@@ -38,6 +41,9 @@ pub struct PathRule {
     pub command: Option<KnownCommand>,
     /// Only applies when this program is installed.
     pub requires: Option<&'static str>,
+    /// In [`Mode::Children`], children whose name starts with this prefix are marked
+    /// [`Risk::Review`] (e.g. `com.apple.` caches, which macOS services may hold open).
+    pub review_prefix: Option<&'static str>,
 }
 
 const MAC: &[Os] = &[Os::MacOs];
@@ -65,6 +71,7 @@ impl PathRule {
             privilege: Privilege::User,
             command: None,
             requires: None,
+            review_prefix: None,
         }
     }
 
@@ -80,6 +87,11 @@ impl PathRule {
 
     const fn review(mut self) -> Self {
         self.risk = Risk::Review;
+        self
+    }
+
+    const fn review_children_starting_with(mut self, prefix: &'static str) -> Self {
+        self.review_prefix = Some(prefix);
         self
     }
 
@@ -104,6 +116,8 @@ const APP_CACHE: &str = "Application cache. Apps rebuild it on demand; quit the 
 const LOGS: &str = "Old log files. Safe to remove.";
 const DEV_CACHE: &str = "Download cache. The tool re-downloads what it needs.";
 const ELECTRON_CACHE: &str = "Electron app cache. Quit the app before cleaning.";
+const APPLE_CACHE: &str = "Used by macOS system services (iCloud, Spotlight, …), which may hold it open or \
+                           rebuild it slowly. Review before removing.";
 
 /// The built-in rule table.
 #[allow(clippy::too_many_lines)]
@@ -113,7 +127,8 @@ pub fn default_rules() -> Vec<PathRule> {
         // ---- Generic cache and log folders -------------------------------------------------
         PathRule::new("mac-user-caches", "User cache", APP_CACHE, MAC, "Library/Caches")
             .children()
-            .category(C::AppCaches),
+            .category(C::AppCaches)
+            .review_children_starting_with("com.apple."),
         PathRule::new("mac-user-logs", "User log", LOGS, MAC, "Library/Logs").children().category(C::Logs),
         PathRule::new("linux-user-cache", "User cache", APP_CACHE, LINUX, ".cache").children().category(C::AppCaches),
         // ---- Electron / browser caches ----------------------------------------------------
@@ -380,6 +395,7 @@ pub fn default_rules() -> Vec<PathRule> {
             "Library/Caches",
         )
         .children()
+        .review_children_starting_with("com.apple.")
         .category(C::System)
         .system_admin(),
         PathRule::new(
@@ -413,6 +429,16 @@ pub fn default_rules() -> Vec<PathRule> {
         .system_admin()
         .command(KnownCommand::DnfClean, "dnf"),
         PathRule::new(
+            "dnf5-cache",
+            "DNF5 package cache",
+            "Downloaded packages and metadata (DNF5, Fedora 41+). Cleaned with `dnf clean all`.",
+            LINUX,
+            "var/cache/libdnf5",
+        )
+        .category(C::System)
+        .system_admin()
+        .command(KnownCommand::DnfClean, "dnf"),
+        PathRule::new(
             "pacman-cache",
             "pacman package cache",
             "Cached packages of uninstalled software. Cleaned with `pacman -Sc`.",
@@ -436,14 +462,32 @@ impl PathRulesScanner {
         Self { rules }
     }
 
-    fn scan_rule(rule: &PathRule, ctx: &ScanContext<'_>) -> Vec<Finding> {
-        if !rule.os.contains(&ctx.os) || rule.requires.is_some_and(|p| !ctx.runner.exists(p)) {
-            return Vec::new();
-        }
-        let target = match rule.base {
+    fn applies(rule: &PathRule, ctx: &ScanContext<'_>) -> bool {
+        rule.os.contains(&ctx.os) && rule.requires.is_none_or(|p| ctx.runner.exists(p))
+    }
+
+    fn target(rule: &PathRule, ctx: &ScanContext<'_>) -> PathBuf {
+        match rule.base {
             Base::Home => ctx.home.join(rule.rel),
             Base::System => ctx.system_root.join(rule.rel),
-        };
+        }
+    }
+
+    /// Targets of the applicable whole-folder rules. Generic children rules skip these folders,
+    /// which would otherwise be walked twice only to be dropped by overlap de-duplication.
+    fn claimed(&self, ctx: &ScanContext<'_>) -> HashSet<PathBuf> {
+        self.rules
+            .iter()
+            .filter(|r| r.mode == Mode::Whole && Self::applies(r, ctx))
+            .map(|r| Self::target(r, ctx))
+            .collect()
+    }
+
+    fn scan_rule(rule: &PathRule, ctx: &ScanContext<'_>, claimed: &HashSet<PathBuf>) -> Vec<Finding> {
+        if !Self::applies(rule, ctx) {
+            return Vec::new();
+        }
+        let target = Self::target(rule, ctx);
         if !is_real_dir(&target) {
             return Vec::new();
         }
@@ -456,9 +500,16 @@ impl PathRulesScanner {
             }
             Mode::Children => children(&target)
                 .par_iter()
+                .filter(|child| !claimed.contains(*child))
                 .filter_map(|child| {
+                    let name = file_name(child);
                     let detail = format!("{} · {}", rule.title, rule.detail);
-                    Self::finding(rule, ctx, child, &target, file_name(child), detail)
+                    let mut finding = Self::finding(rule, ctx, child, &target, name.clone(), detail)?;
+                    if rule.review_prefix.is_some_and(|prefix| name.starts_with(prefix)) {
+                        finding.risk = Risk::Review;
+                        finding.detail = format!("{} · {APPLE_CACHE}", rule.title);
+                    }
+                    Some(finding)
                 })
                 .collect(),
         }
@@ -475,8 +526,8 @@ impl PathRulesScanner {
         if ctx.is_cancelled() {
             return None;
         }
-        let bytes = ctx.measure(path).bytes;
-        if bytes < MIN_BYTES {
+        let report = ctx.measure(path)?;
+        if report.bytes < MIN_BYTES {
             return None;
         }
         let action = match &rule.command {
@@ -484,9 +535,9 @@ impl PathRulesScanner {
             None => CleanupAction::RemovePath { path: path.to_path_buf(), root: root.to_path_buf() },
         };
         Some(Finding {
-            detail,
+            detail: with_shared_note(detail, &report),
             path: Some(path.to_path_buf()),
-            bytes: Some(bytes),
+            bytes: Some(report.bytes),
             risk: rule.risk,
             privilege: rule.privilege,
             action: Some(action),
@@ -510,7 +561,8 @@ impl Scanner for PathRulesScanner {
     }
 
     fn scan(&self, ctx: &ScanContext<'_>) -> Result<Vec<Finding>, ScanError> {
-        Ok(self.rules.par_iter().flat_map(|rule| Self::scan_rule(rule, ctx)).collect())
+        let claimed = self.claimed(ctx);
+        Ok(self.rules.par_iter().flat_map(|rule| Self::scan_rule(rule, ctx, &claimed)).collect())
     }
 }
 
@@ -573,6 +625,42 @@ mod tests {
     }
 
     #[test]
+    fn apple_caches_need_review() {
+        let env = Env::new();
+        env.file("Library/Caches/com.apple.bird/data", BIG);
+        env.file("Library/Caches/com.vendor.app/data", BIG);
+        env.sys_file("Library/Caches/com.apple.iconservices.store/data", BIG);
+        let runner = FakeRunner::new();
+        let found = scan(&env, Os::MacOs, &runner);
+        let risks: Vec<_> = found.iter().map(|f| (f.title.as_str(), f.risk)).collect();
+        assert_eq!(
+            risks,
+            [
+                ("com.apple.iconservices.store", Risk::Review),
+                ("com.apple.bird", Risk::Review),
+                ("com.vendor.app", Risk::Safe),
+            ]
+        );
+        assert!(found[1].detail.contains("macOS system services"));
+    }
+
+    #[test]
+    fn generic_rules_skip_folders_claimed_by_specific_rules() {
+        let env = Env::new();
+        env.file(".cache/pip/http/a", BIG);
+        env.file(".cache/other/x", BIG);
+        let runner = FakeRunner::new();
+        let scanner = PathRulesScanner::new(default_rules());
+        let ctx = env.ctx(Os::Linux, &runner);
+        assert!(scanner.claimed(&ctx).contains(&env.home.join(".cache/pip")));
+        assert!(!scanner.claimed(&ctx).contains(&env.home.join("var/cache/apt/archives")), "needs apt-get");
+        let ids: Vec<_> = scan(&env, Os::Linux, &runner).into_iter().map(|f| f.id).collect();
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        assert!(ids.iter().any(|id| id.starts_with("linux-user-cache:") && id.ends_with("other")));
+        assert!(ids.iter().any(|id| id.starts_with("pip-cache-linux:")));
+    }
+
+    #[test]
     fn whole_rule_uses_parent_as_root() {
         let env = Env::new();
         env.file(".cargo/registry/cache/index/crate.crate", BIG);
@@ -620,6 +708,17 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].privilege, Privilege::Admin);
         assert_eq!(found[0].action, Some(CleanupAction::Run(KnownCommand::AptClean)));
+    }
+
+    #[test]
+    fn dnf5_cache_is_covered() {
+        let env = Env::new();
+        env.sys_file("var/cache/libdnf5/fedora-abc/packages/x.rpm", BIG);
+        let runner = FakeRunner::new().installed("dnf");
+        let found = scan(&env, Os::Linux, &runner);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].title, "DNF5 package cache");
+        assert_eq!(found[0].action, Some(CleanupAction::Run(KnownCommand::DnfClean)));
     }
 
     #[test]
