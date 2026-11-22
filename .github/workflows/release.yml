@@ -143,7 +143,7 @@ jobs:
           cat > notes.md <<EOF
           ## Install
 
-          **macOS** (Apple Silicon: \`aarch64\`, Intel: \`x86_64\`): open the \`.dmg\` and drag diskdust to Applications.
+          **macOS** (Apple Silicon: \`_aarch64.dmg\`, Intel: \`_x64.dmg\`): open the \`.dmg\` and drag diskdust to Applications.
           The app is not notarized yet, so the first launch shows "cannot be verified": right-click the app → **Open**,
           or run \`xattr -d com.apple.quarantine /Applications/diskdust.app\`.
 

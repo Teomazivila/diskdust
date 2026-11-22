@@ -14,7 +14,7 @@ Download the file for your system from the
 | System | File | How |
 |---|---|---|
 | macOS, Apple Silicon | `diskdust_<version>_aarch64.dmg` | Open it and drag **diskdust** to Applications |
-| macOS, Intel | `diskdust_<version>_x86_64.dmg` | same |
+| macOS, Intel | `diskdust_<version>_x64.dmg` | same |
 | Debian / Ubuntu | `diskdust_<version>_amd64.deb` / `_arm64.deb` | `sudo apt install ./diskdust_<version>_amd64.deb` |
 | Other Linux | `diskdust_<version>_x86_64.AppImage` / `_aarch64.AppImage` | `chmod +x` it and run it |
 
