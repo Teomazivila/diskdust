@@ -2,11 +2,13 @@
 
 mod artifacts;
 mod docker;
+mod installers;
 mod orphans;
 mod paths;
 mod toolchains;
 mod tools;
 mod trash;
+mod vms;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,11 +22,13 @@ use crate::size::{self, SizeReport};
 
 pub use artifacts::BuildArtifactsScanner;
 pub use docker::DockerScanner;
+pub use installers::InstallersScanner;
 pub use orphans::OrphanedAppDataScanner;
 pub use paths::{Base, Mode, PathRule, PathRulesScanner, default_rules, resolved_rule_paths};
 pub use toolchains::ToolchainsScanner;
 pub use tools::{GoScanner, HomebrewScanner, JournalScanner, SimulatorScanner, SnapScanner, TimeMachineScanner};
 pub use trash::TrashScanner;
+pub use vms::VmDisksScanner;
 
 /// Items smaller than this are not worth showing.
 pub const MIN_BYTES: u64 = 1024 * 1024;
@@ -149,6 +153,8 @@ pub fn default_scanners() -> Vec<Box<dyn Scanner>> {
         Box::new(OrphanedAppDataScanner),
         Box::new(BuildArtifactsScanner),
         Box::new(ToolchainsScanner),
+        Box::new(InstallersScanner),
+        Box::new(VmDisksScanner),
         Box::new(TimeMachineScanner),
         Box::new(JournalScanner),
         Box::new(SnapScanner),

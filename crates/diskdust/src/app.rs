@@ -758,23 +758,28 @@ fn permanent_warning(titles: &[&str]) -> String {
     )
 }
 
-/// macOS asks before an app reads Documents, Desktop or Downloads. Explain the prompt up front when
-/// a default project folder lives there.
+/// macOS asks before an app reads Documents, Desktop or Downloads. Explain the prompts up front:
+/// Downloads is always checked for old installers; the others when a project folder lives there.
 fn privacy_prompt_note(os: Os, home: &std::path::Path, roots: &[PathBuf]) -> Option<String> {
     if os != Os::MacOs {
         return None;
     }
-    let protected: Vec<&str> = ["Documents", "Desktop", "Downloads"]
+    let projects: Vec<&str> = ["Documents", "Desktop"]
         .into_iter()
         .filter(|name| roots.iter().any(|r| r.starts_with(home.join(name))))
         .collect();
-    (!protected.is_empty()).then(|| {
-        format!(
-            "macOS may ask to let diskdust access your {} folder: it looks for build output (target/, \
-             node_modules/, …) in project folders there. Remove the folder under Project folders to skip it.",
-            protected.join(" and ")
-        )
-    })
+    let mut note = "macOS may ask to let diskdust access your Downloads folder, where it looks for old \
+                    installers."
+        .to_owned();
+    if !projects.is_empty() {
+        let _ = write!(
+            note,
+            " It may also ask for your {} folder: project folders there are searched for build output \
+             (target/, node_modules/, …). Remove a folder under Project folders to skip it.",
+            projects.join(" and ")
+        );
+    }
+    Some(note)
 }
 
 fn clean_summary(t: &CleanTally) -> String {
@@ -983,7 +988,8 @@ mod tests {
         let docs = vec![PathBuf::from("/Users/a/Documents"), PathBuf::from("/Users/a/code")];
         assert!(privacy_prompt_note(Os::MacOs, home, &docs).expect("note").contains("your Documents folder"));
         assert!(privacy_prompt_note(Os::Linux, home, &docs).is_none());
-        assert!(privacy_prompt_note(Os::MacOs, home, &[PathBuf::from("/Users/a/code")]).is_none());
+        let only_code = privacy_prompt_note(Os::MacOs, home, &[PathBuf::from("/Users/a/code")]).expect("note");
+        assert!(only_code.contains("Downloads") && !only_code.contains("Documents"));
     }
 
     #[test]
