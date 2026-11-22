@@ -68,7 +68,8 @@ jobs:
     # Runs after a successful verify (release) or without it (pull-request dry run).
     if: always() && (needs.verify.result == 'success' || github.event_name == 'pull_request')
     strategy:
-      fail-fast: true
+      # Every platform reports its own result; publish still needs all four.
+      fail-fast: false
       matrix:
         include:
           - { name: macos-aarch64, os: macos-latest, formats: dmg }
@@ -86,12 +87,18 @@ jobs:
       # Toolchain from rust-toolchain.toml. No build cache: release artifacts are built from scratch.
       - run: rustup show active-toolchain || rustup toolchain install
       - run: cargo install cargo-packager --version "$PACKAGER_VERSION" --locked
-      - run: cargo packager --release --formats "${{ matrix.formats }}" --out-dir dist
+      # cargo-packager resolves a relative --out-dir against the package directory.
+      - run: cargo packager --release --formats "${{ matrix.formats }}" --out-dir "$GITHUB_WORKSPACE/dist"
       - name: Smoke-test the packaged binary
         shell: bash
         run: |
           set -euo pipefail
-          ls -la dist
+          shopt -s nullglob
+          packages=(dist/*.dmg dist/*.deb dist/*.AppImage)
+          if [ ${#packages[@]} -eq 0 ]; then
+            echo "::error::cargo-packager produced no packages in dist/"; exit 1
+          fi
+          ls -la "${packages[@]}"
           ./target/release/diskdust --help
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
