@@ -1,0 +1,49 @@
+# cargo-deny configuration (cargo-deny 0.19). Run: `cargo deny --locked check`.
+
+[graph]
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+all-features = false
+
+[advisories]
+# Unmaintained (not vulnerable) crates pulled in by egui. Every upstream crate is at its latest
+# release; removing them means dropping egui's fonts or Linux accessibility. Re-review on every
+# egui/eframe/opener upgrade. Keep in sync with .cargo/audit.toml.
+ignore = [
+    # ttf-parser: font parsing for egui via epaint -> ab_glyph -> owned_ttf_parser.
+    { id = "RUSTSEC-2026-0192", reason = "transitive via egui fonts; no maintained alternative in egui 0.37" },
+    # zbus_names / zvariant / zvariant_derive: D-Bus via accesskit_unix (Linux a11y) and opener (reveal).
+    { id = "RUSTSEC-2026-0370", reason = "transitive via zbus 5 (accesskit_unix, opener); both at latest" },
+    { id = "RUSTSEC-2026-0371", reason = "transitive via zbus 5 (accesskit_unix, opener); both at latest" },
+    { id = "RUSTSEC-2026-0372", reason = "transitive via zbus 5 (accesskit_unix, opener); both at latest" },
+]
+
+[licenses]
+# Permissive licenses only. Crates offering GPL/LGPL do so as an alternative to MIT/Apache-2.0,
+# which cargo-deny selects. MPL-2.0 (option-ext) is file-level copyleft; we ship it unmodified.
+# OFL-1.1 and Ubuntu-font-1.0 cover the fonts embedded by egui.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
