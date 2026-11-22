@@ -83,6 +83,27 @@ pub fn measure(path: &Path, cancel: &AtomicBool) -> SizeReport {
     })
 }
 
+/// The `limit` largest direct children of `dir` by reclaimable bytes, largest first. Symlinks are
+/// skipped; a cancelled walk returns what was fully measured.
+pub fn largest_children(dir: &Path, cancel: &AtomicBool, limit: usize) -> Vec<(std::path::PathBuf, u64)> {
+    let Ok(read) = fs::read_dir(dir) else { return Vec::new() };
+    let entries: Vec<std::path::PathBuf> = read
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_ok_and(|t| !t.is_symlink()))
+        .map(|e| e.path())
+        .collect();
+    let mut sized: Vec<(std::path::PathBuf, u64)> = entries
+        .into_par_iter()
+        .filter_map(|path| {
+            let report = measure(&path, cancel);
+            report.complete.then_some((path, report.bytes))
+        })
+        .collect();
+    sized.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    sized.truncate(limit);
+    sized
+}
+
 /// A hard-linked inode met during the walk.
 struct Inode {
     nlink: u64,
@@ -192,6 +213,23 @@ mod tests {
         assert_eq!(report.newest, Some(folder));
         assert!(folder > 499_162_500);
         assert_eq!(measure(Path::new("/definitely/not/here"), &not_cancelled()).newest, None);
+    }
+
+    #[test]
+    fn largest_children_sorted_and_limited() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, len) in [("small", 10_000usize), ("big", 300_000), ("mid", 100_000)] {
+            fs::create_dir(dir.path().join(name)).expect("mkdir");
+            fs::write(dir.path().join(name).join("f"), vec![1u8; len]).expect("write");
+        }
+        symlink(dir.path().join("big"), dir.path().join("link")).expect("symlink");
+        let top = largest_children(dir.path(), &not_cancelled(), 2);
+        let names: Vec<_> =
+            top.iter().map(|(p, _)| p.file_name().expect("name").to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["big", "mid"]);
+        assert!(top[0].1 >= 300_000);
+        assert!(largest_children(&dir.path().join("big/f"), &not_cancelled(), 5).is_empty(), "files have no children");
+        assert!(largest_children(dir.path(), &AtomicBool::new(true), 5).iter().all(|(p, _)| !p.is_dir()));
     }
 
     #[test]

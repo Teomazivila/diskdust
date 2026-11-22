@@ -20,9 +20,18 @@ use crate::session::{Elevation, clean_findings, default_audit_log};
 #[derive(Debug)]
 pub enum Msg {
     Scan(ScanEvent),
-    ScanDone { findings: Vec<Finding>, elapsed: Duration, cancelled: bool },
+    ScanDone {
+        findings: Vec<Finding>,
+        elapsed: Duration,
+        cancelled: bool,
+    },
     Cleaned(CleanResult),
     CleanDone,
+    /// Largest children of a finding's folder, for the details panel.
+    Breakdown {
+        id: String,
+        entries: Vec<(PathBuf, u64)>,
+    },
 }
 
 /// Notifies the UI thread; failures mean the window closed, which is fine to ignore.
@@ -69,6 +78,19 @@ pub fn spawn_scan(os: Os, home: PathBuf, project_roots: Vec<PathBuf>, cancel: Ar
     });
     if let Err(e) = spawned {
         tracing::error!(error = %e, "failed to start scan thread");
+    }
+}
+
+/// Number of sub-folders listed in the details panel.
+const BREAKDOWN_LIMIT: usize = 12;
+
+pub fn spawn_breakdown(id: String, path: PathBuf, notifier: Notifier) {
+    let spawned = thread::Builder::new().name("diskdust-breakdown".into()).spawn(move || {
+        let entries = diskdust_core::size::largest_children(&path, &AtomicBool::new(false), BREAKDOWN_LIMIT);
+        notifier.send(Msg::Breakdown { id, entries });
+    });
+    if let Err(e) = spawned {
+        tracing::error!(error = %e, "failed to start breakdown thread");
     }
 }
 
