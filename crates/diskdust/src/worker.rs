@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use diskdust_core::audit::{AuditEntry, AuditLog};
-use diskdust_core::clean::{Cleaner, DeleteMode, SystemTrash};
+use diskdust_core::clean::{Cleaner, DeleteMode, SystemTrash, quit_first_reason};
 use diskdust_core::command::{CommandRunner, SystemRunner};
 use diskdust_core::model::{CleanupAction, Finding, Os, Privilege};
 use diskdust_core::privilege::{
@@ -139,6 +139,10 @@ fn clean(os: Os, home: &Path, findings: &[Finding], mode: DeleteMode, notifier: 
 
     for finding in user {
         let Some(action) = &finding.action else { continue };
+        if let Some(reason) = quit_first_reason(&runner, finding) {
+            report(finding, action, false, reason, false);
+            continue;
+        }
         match cleaner.execute(action) {
             Ok(message) => report(finding, action, true, message, false),
             Err(e) => report(finding, action, false, e.to_string(), false),

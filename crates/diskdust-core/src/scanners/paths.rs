@@ -8,7 +8,9 @@ use rayon::prelude::*;
 use super::{
     MIN_BYTES, ScanContext, ScanError, Scanner, base_finding, children, file_name, is_real_dir, with_shared_note,
 };
-use crate::model::{Category, CleanupAction, Finding, GENERIC, KnownCommand, Os, Privilege, Risk, SPECIFIC};
+use crate::model::{
+    Category, CleanupAction, Finding, GENERIC, KnownCommand, Os, Privilege, Risk, RunningApp, SPECIFIC,
+};
 
 /// Where a rule's relative path is anchored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +46,8 @@ pub struct PathRule {
     /// In [`Mode::Children`], children whose name starts with this prefix are marked
     /// [`Risk::Review`] (e.g. `com.apple.` caches, which macOS services may hold open).
     pub review_prefix: Option<&'static str>,
+    /// App that must not be running while this location is cleaned: name and `pgrep` arguments.
+    pub quit_first: Option<(&'static str, [&'static str; 2])>,
 }
 
 const MAC: &[Os] = &[Os::MacOs];
@@ -72,7 +76,14 @@ impl PathRule {
             command: None,
             requires: None,
             review_prefix: None,
+            quit_first: None,
         }
+    }
+
+    /// Requires `app` to be quit first; `pgrep` is the argument pair matching its processes.
+    const fn quit(mut self, app: &'static str, pgrep: [&'static str; 2]) -> Self {
+        self.quit_first = Some((app, pgrep));
+        self
     }
 
     const fn children(mut self) -> Self {
@@ -112,6 +123,18 @@ impl PathRule {
     }
 }
 
+// `pgrep` matchers. macOS: the bundle's executable path (-f); Linux: the process name (-x).
+const MAC_SLACK: [&str; 2] = ["-f", "Slack.app/Contents/MacOS/"];
+const MAC_VSCODE: [&str; 2] = ["-f", "Visual Studio Code.app/Contents/MacOS/"];
+const MAC_CURSOR: [&str; 2] = ["-f", "Cursor.app/Contents/MacOS/"];
+const MAC_DISCORD: [&str; 2] = ["-f", "Discord.app/Contents/MacOS/"];
+const MAC_CHROME: [&str; 2] = ["-f", "Google Chrome.app/Contents/MacOS/"];
+const MAC_XCODE: [&str; 2] = ["-f", "Xcode.app/Contents/MacOS/Xcode"];
+const LINUX_SLACK: [&str; 2] = ["-x", "slack"];
+const LINUX_VSCODE: [&str; 2] = ["-x", "code"];
+const LINUX_DISCORD: [&str; 2] = ["-x", "Discord"];
+const LINUX_CHROME: [&str; 2] = ["-x", "chrome"];
+
 const APP_CACHE: &str = "Application cache. Apps rebuild it on demand; quit the app first.";
 const LOGS: &str = "Old log files. Safe to remove.";
 const DEV_CACHE: &str = "Download cache. The tool re-downloads what it needs.";
@@ -133,7 +156,8 @@ pub fn default_rules() -> Vec<PathRule> {
         PathRule::new("linux-user-cache", "User cache", APP_CACHE, LINUX, ".cache").children().category(C::AppCaches),
         // ---- Electron / browser caches ----------------------------------------------------
         PathRule::new("slack-cache", "Slack cache", ELECTRON_CACHE, MAC, "Library/Application Support/Slack/Cache")
-            .category(C::AppCaches),
+            .category(C::AppCaches)
+            .quit("Slack", MAC_SLACK),
         PathRule::new(
             "slack-sw-cache",
             "Slack service worker cache",
@@ -141,9 +165,11 @@ pub fn default_rules() -> Vec<PathRule> {
             MAC,
             "Library/Application Support/Slack/Service Worker/CacheStorage",
         )
-        .category(C::AppCaches),
+        .category(C::AppCaches)
+        .quit("Slack", MAC_SLACK),
         PathRule::new("vscode-cache", "VS Code cache", ELECTRON_CACHE, MAC, "Library/Application Support/Code/Cache")
-            .category(C::AppCaches),
+            .category(C::AppCaches)
+            .quit("Visual Studio Code", MAC_VSCODE),
         PathRule::new(
             "vscode-cached-data",
             "VS Code cached data",
@@ -151,7 +177,8 @@ pub fn default_rules() -> Vec<PathRule> {
             MAC,
             "Library/Application Support/Code/CachedData",
         )
-        .category(C::AppCaches),
+        .category(C::AppCaches)
+        .quit("Visual Studio Code", MAC_VSCODE),
         PathRule::new(
             "vscode-vsix",
             "VS Code extension downloads",
@@ -159,9 +186,11 @@ pub fn default_rules() -> Vec<PathRule> {
             MAC,
             "Library/Application Support/Code/CachedExtensionVSIXs",
         )
-        .category(C::AppCaches),
+        .category(C::AppCaches)
+        .quit("Visual Studio Code", MAC_VSCODE),
         PathRule::new("cursor-cache", "Cursor cache", ELECTRON_CACHE, MAC, "Library/Application Support/Cursor/Cache")
-            .category(C::AppCaches),
+            .category(C::AppCaches)
+            .quit("Cursor", MAC_CURSOR),
         PathRule::new(
             "cursor-cached-data",
             "Cursor cached data",
@@ -169,7 +198,8 @@ pub fn default_rules() -> Vec<PathRule> {
             MAC,
             "Library/Application Support/Cursor/CachedData",
         )
-        .category(C::AppCaches),
+        .category(C::AppCaches)
+        .quit("Cursor", MAC_CURSOR),
         PathRule::new(
             "discord-cache",
             "Discord cache",
@@ -177,7 +207,8 @@ pub fn default_rules() -> Vec<PathRule> {
             MAC,
             "Library/Application Support/discord/Cache",
         )
-        .category(C::AppCaches),
+        .category(C::AppCaches)
+        .quit("Discord", MAC_DISCORD),
         PathRule::new(
             "chrome-sw-cache",
             "Chrome service worker cache",
@@ -185,9 +216,11 @@ pub fn default_rules() -> Vec<PathRule> {
             MAC,
             "Library/Application Support/Google/Chrome/Default/Service Worker/CacheStorage",
         )
-        .category(C::AppCaches),
+        .category(C::AppCaches)
+        .quit("Google Chrome", MAC_CHROME),
         PathRule::new("linux-slack-cache", "Slack cache", ELECTRON_CACHE, LINUX, ".config/Slack/Cache")
-            .category(C::AppCaches),
+            .category(C::AppCaches)
+            .quit("Slack", LINUX_SLACK),
         PathRule::new(
             "linux-slack-sw-cache",
             "Slack service worker cache",
@@ -195,9 +228,11 @@ pub fn default_rules() -> Vec<PathRule> {
             LINUX,
             ".config/Slack/Service Worker/CacheStorage",
         )
-        .category(C::AppCaches),
+        .category(C::AppCaches)
+        .quit("Slack", LINUX_SLACK),
         PathRule::new("linux-vscode-cache", "VS Code cache", ELECTRON_CACHE, LINUX, ".config/Code/Cache")
-            .category(C::AppCaches),
+            .category(C::AppCaches)
+            .quit("Visual Studio Code", LINUX_VSCODE),
         PathRule::new(
             "linux-vscode-cached-data",
             "VS Code cached data",
@@ -205,7 +240,8 @@ pub fn default_rules() -> Vec<PathRule> {
             LINUX,
             ".config/Code/CachedData",
         )
-        .category(C::AppCaches),
+        .category(C::AppCaches)
+        .quit("Visual Studio Code", LINUX_VSCODE),
         PathRule::new(
             "linux-vscode-vsix",
             "VS Code extension downloads",
@@ -213,9 +249,11 @@ pub fn default_rules() -> Vec<PathRule> {
             LINUX,
             ".config/Code/CachedExtensionVSIXs",
         )
-        .category(C::AppCaches),
+        .category(C::AppCaches)
+        .quit("Visual Studio Code", LINUX_VSCODE),
         PathRule::new("linux-discord-cache", "Discord cache", ELECTRON_CACHE, LINUX, ".config/discord/Cache")
-            .category(C::AppCaches),
+            .category(C::AppCaches)
+            .quit("Discord", LINUX_DISCORD),
         PathRule::new(
             "linux-chrome-sw-cache",
             "Chrome service worker cache",
@@ -223,7 +261,8 @@ pub fn default_rules() -> Vec<PathRule> {
             LINUX,
             ".config/google-chrome/Default/Service Worker/CacheStorage",
         )
-        .category(C::AppCaches),
+        .category(C::AppCaches)
+        .quit("Google Chrome", LINUX_CHROME),
         // ---- Developer caches ---------------------------------------------------------------
         PathRule::new(
             "cargo-registry",
@@ -329,7 +368,8 @@ pub fn default_rules() -> Vec<PathRule> {
             MAC,
             "Library/Developer/Xcode/DerivedData",
         )
-        .category(C::Xcode),
+        .category(C::Xcode)
+        .quit("Xcode", MAC_XCODE),
         PathRule::new(
             "xcode-archives",
             "Xcode archive",
@@ -539,6 +579,10 @@ impl PathRulesScanner {
             path: Some(path.to_path_buf()),
             bytes: Some(report.bytes),
             last_modified: report.newest,
+            quit_first: rule.quit_first.map(|(app, pgrep)| RunningApp {
+                app: app.to_owned(),
+                pgrep: pgrep.iter().map(|a| (*a).to_owned()).collect(),
+            }),
             risk: rule.risk,
             privilege: rule.privilege,
             action: Some(action),
@@ -659,6 +703,43 @@ mod tests {
         assert_eq!(ids.len(), 2, "{ids:?}");
         assert!(ids.iter().any(|id| id.starts_with("linux-user-cache:") && id.ends_with("other")));
         assert!(ids.iter().any(|id| id.starts_with("pip-cache-linux:")));
+    }
+
+    #[test]
+    fn app_caches_require_quitting_the_app() {
+        let env = Env::new();
+        env.file("Library/Application Support/Slack/Cache/data", BIG);
+        let runner = FakeRunner::new();
+        let found = scan(&env, Os::MacOs, &runner);
+        assert_eq!(found.len(), 1);
+        let quit = found[0].quit_first.as_ref().expect("quit_first");
+        assert_eq!(quit.app, "Slack");
+        assert_eq!(quit.pgrep, ["-f", "Slack.app/Contents/MacOS/"]);
+        let mut guarded: Vec<_> =
+            default_rules().iter().filter_map(|r| r.quit_first.map(|(app, _)| format!("{}={app}", r.id))).collect();
+        guarded.sort();
+        assert_eq!(
+            guarded,
+            [
+                "chrome-sw-cache=Google Chrome",
+                "cursor-cache=Cursor",
+                "cursor-cached-data=Cursor",
+                "discord-cache=Discord",
+                "linux-chrome-sw-cache=Google Chrome",
+                "linux-discord-cache=Discord",
+                "linux-slack-cache=Slack",
+                "linux-slack-sw-cache=Slack",
+                "linux-vscode-cache=Visual Studio Code",
+                "linux-vscode-cached-data=Visual Studio Code",
+                "linux-vscode-vsix=Visual Studio Code",
+                "slack-cache=Slack",
+                "slack-sw-cache=Slack",
+                "vscode-cache=Visual Studio Code",
+                "vscode-cached-data=Visual Studio Code",
+                "vscode-vsix=Visual Studio Code",
+                "xcode-derived-data=Xcode",
+            ]
+        );
     }
 
     #[test]

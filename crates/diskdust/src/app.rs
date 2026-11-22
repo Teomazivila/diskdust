@@ -639,6 +639,10 @@ impl DiskdustApp {
         let review = chosen.iter().filter(|f| f.risk == Risk::Review).count();
         let admin = chosen.iter().filter(|f| f.privilege == Privilege::Admin).count();
         let unknown = chosen.iter().filter(|f| f.bytes.is_none()).count();
+        let mut quit_apps: Vec<&str> =
+            chosen.iter().filter_map(|f| f.quit_first.as_ref().map(|q| q.app.as_str())).collect();
+        quit_apps.sort_unstable();
+        quit_apps.dedup();
         let permanent: Vec<&str> =
             chosen.iter().filter(|f| removed_permanently_in_trash_mode(f)).map(|f| f.title.as_str()).collect();
         let mut confirmed = false;
@@ -671,6 +675,16 @@ impl DiskdustApp {
                     RichText::new(format!(
                         "{ICON_WARN} {} marked Review and may contain data you want to keep.",
                         format::items_are(review)
+                    ))
+                    .color(REVIEW),
+                );
+            }
+            if !quit_apps.is_empty() {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!(
+                        "{ICON_WARN} Quit {} first. Items of apps that are still running are skipped.",
+                        quit_apps.join(", ")
                     ))
                     .color(REVIEW),
                 );
@@ -1121,6 +1135,7 @@ mod tests {
             harness.get_by_label_contains("2 items are marked Review");
             harness.get_by_label_contains("1 item needs administrator access");
             harness.get_by_label_contains("2 items are removed permanently, not moved to the Trash");
+            assert!(harness.query_by_label_contains("first. Items of apps").is_none(), "no app to quit");
             save(&mut harness, "confirm");
             harness.get_by_label("Cancel").click();
             harness.run();

@@ -267,6 +267,10 @@ pub(crate) mod testutil {
     }
 
     pub const BIG: usize = 2 * 1024 * 1024;
+
+    pub fn sample_finding() -> Finding {
+        base_finding("test", "test:item".to_owned(), Category::AppCaches, "Item".to_owned())
+    }
 }
 
 #[cfg(test)]
