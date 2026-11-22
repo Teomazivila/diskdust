@@ -12,7 +12,7 @@ use diskdust_core::clean::{Cleaner, DeleteMode, SystemTrash};
 use diskdust_core::command::{CommandRunner, SystemRunner};
 use diskdust_core::model::{CleanupAction, Finding, Os, Privilege};
 use diskdust_core::privilege::{
-    HelperResult, describe_elevation_failure, elevation_argv, encode_payload, parse_helper_output,
+    HelperResult, describe_elevation_failure, elevation_argv, encode_payload, helper_executable, parse_helper_output,
 };
 use diskdust_core::safety::SafetyPolicy;
 use diskdust_core::scan::{ScanEvent, run_scan};
@@ -165,10 +165,14 @@ fn run_elevated(os: Os, runner: &dyn CommandRunner, actions: &[CleanupAction]) -
     let fail_all =
         |message: String| actions.iter().map(|_| HelperResult { ok: false, message: message.clone() }).collect();
     let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
+        Ok(exe) => helper_executable(exe, std::env::var_os("APPIMAGE").as_deref()),
         Err(e) => return fail_all(format!("cannot locate the diskdust executable: {e}")),
     };
-    let argv = elevation_argv(os, &exe, &encode_payload(actions));
+    let payload = match encode_payload(actions) {
+        Ok(payload) => payload,
+        Err(e) => return fail_all(e.to_string()),
+    };
+    let argv = elevation_argv(os, &exe, &payload);
     match runner.run(&argv, Duration::from_mins(30)) {
         Ok(out) if out.success => parse_helper_output(&out.stdout, actions.len()),
         Ok(out) => fail_all(describe_elevation_failure(os, out.code, &out.stderr)),

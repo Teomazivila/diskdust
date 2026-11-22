@@ -10,7 +10,6 @@ mod cli;
 mod format;
 mod worker;
 
-use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::Context as _;
@@ -55,7 +54,7 @@ fn helper(payload: &str) -> ExitCode {
         eprintln!("diskdust helper: unsupported platform");
         return ExitCode::from(2);
     };
-    let runner = SystemRunner::new(Path::new("/"));
+    let runner = SystemRunner::trusted();
     match privilege::run_helper(payload, &privilege::admin_roots(os), &runner, &SystemTrash) {
         Ok(results) => {
             print!("{}", privilege::format_helper_output(&results));

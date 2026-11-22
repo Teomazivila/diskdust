@@ -48,7 +48,12 @@ pub trait CommandRunner: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct SystemRunner {
     search_path: Vec<PathBuf>,
+    /// Start children with an empty environment (plus `PATH` and `LC_ALL`).
+    clear_env: bool,
 }
+
+/// Root-owned system program directories, the only ones the privileged helper searches.
+const TRUSTED_PATH: [&str; 4] = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
 
 impl SystemRunner {
     pub fn new(home: &Path) -> Self {
@@ -75,7 +80,14 @@ impl SystemRunner {
                 search_path.push(extra);
             }
         }
-        Self { search_path }
+        Self { search_path, clear_env: false }
+    }
+
+    /// Runner for the privileged helper: resolves programs only in root-owned system directories,
+    /// ignores the inherited `PATH`, and starts children with a cleared environment, so nothing
+    /// in a user-writable location (Homebrew, linuxbrew, `~/go/bin`) can run as root.
+    pub fn trusted() -> Self {
+        Self { search_path: TRUSTED_PATH.iter().map(PathBuf::from).collect(), clear_env: true }
     }
 
     fn resolve(&self, program: &str) -> Option<PathBuf> {
@@ -95,7 +107,11 @@ impl CommandRunner for SystemRunner {
     fn run(&self, argv: &[String], timeout: Duration) -> Result<CommandOutput, CommandError> {
         let (program, rest) = argv.split_first().ok_or(CommandError::Empty)?;
         let resolved = self.resolve(program).ok_or_else(|| CommandError::NotFound(program.clone()))?;
-        let child = Command::new(&resolved)
+        let mut command = Command::new(&resolved);
+        if self.clear_env {
+            command.env_clear();
+        }
+        let child = command
             .args(rest)
             .env("PATH", self.joined_path())
             .env("HOMEBREW_NO_AUTO_UPDATE", "1")
@@ -243,6 +259,19 @@ mod tests {
         assert!(runner().exists("sh"));
         assert!(runner().exists("/bin/sh"));
         assert!(!runner().exists("/bin/diskdust-no-such-tool"));
+    }
+
+    #[test]
+    fn trusted_runner_uses_only_system_dirs_and_a_clean_env() {
+        let trusted = SystemRunner::trusted();
+        assert_eq!(trusted.search_path, TRUSTED_PATH.iter().map(PathBuf::from).collect::<Vec<_>>());
+        assert!(trusted.exists("sh"));
+        assert!(!trusted.exists("diskdust-no-such-tool"));
+        // HOME is set for the test process; the cleared child environment must not see it.
+        let out =
+            trusted.run(&argv(&["sh", "-c", "echo \"$HOME|$PATH|$LC_ALL\""]), Duration::from_secs(5)).expect("run");
+        assert_eq!(out.stdout.trim(), "|/usr/bin:/bin:/usr/sbin:/sbin|C");
+        assert!(!runner().clear_env);
     }
 
     #[test]

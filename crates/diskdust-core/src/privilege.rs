@@ -5,6 +5,7 @@
 //! OS-native authorization prompt. The helper ignores any root directory sent by the caller and
 //! validates every action against its own fixed allowlist.
 
+use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -25,6 +26,8 @@ pub enum PayloadError {
     Hex,
     #[error("payload is not a valid action list: {0}")]
     Json(String),
+    #[error("could not encode the action list: {0}")]
+    Encode(String),
 }
 
 /// Result of one action executed by the helper.
@@ -42,13 +45,25 @@ pub fn admin_roots(os: Os) -> Vec<PathBuf> {
     }
 }
 
-pub fn encode_payload(actions: &[CleanupAction]) -> String {
-    let json = serde_json::to_vec(actions).unwrap_or_default();
+pub fn encode_payload(actions: &[CleanupAction]) -> Result<String, PayloadError> {
+    let json = serde_json::to_vec(actions).map_err(|e| PayloadError::Encode(e.to_string()))?;
     let mut out = String::with_capacity(json.len() * 2);
     for byte in json {
         let _ = write!(out, "{byte:02x}");
     }
-    out
+    Ok(out)
+}
+
+/// The program to launch as the helper.
+///
+/// Inside a Linux `AppImage`, `current_exe()` lives in the user's FUSE mount, which root cannot
+/// open; the `AppImage` file itself (`$APPIMAGE`) is executable by root, so it is used instead when
+/// it is an absolute path to an existing regular file.
+pub fn helper_executable(current_exe: PathBuf, appimage: Option<&OsStr>) -> PathBuf {
+    appimage
+        .map(Path::new)
+        .filter(|p| p.is_absolute() && std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file()))
+        .map_or(current_exe, Path::to_path_buf)
 }
 
 pub fn decode_payload(hex: &str) -> Result<Vec<CleanupAction>, PayloadError> {
@@ -167,7 +182,7 @@ mod tests {
             CleanupAction::Run(KnownCommand::AptClean),
             CleanupAction::RemovePath { path: "/Library/Caches/it's \"odd\"".into(), root: "/Library/Caches".into() },
         ];
-        let hex = encode_payload(&actions);
+        let hex = encode_payload(&actions).expect("encode");
         assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()));
         assert_eq!(decode_payload(&hex).expect("decode"), actions);
     }
@@ -204,9 +219,13 @@ mod tests {
             CleanupAction::Run(KnownCommand::BrewCleanup),
         ];
         let runner = FakeRunner::new().installed("brew");
-        let results =
-            run_helper(&encode_payload(&actions), std::slice::from_ref(&root), &runner, &RecordingTrash::default())
-                .expect("run");
+        let results = run_helper(
+            &encode_payload(&actions).expect("encode"),
+            std::slice::from_ref(&root),
+            &runner,
+            &RecordingTrash::default(),
+        )
+        .expect("run");
         assert!(results[0].ok, "{results:?}");
         assert!(!root.join("vendor").exists());
         assert!(!results[1].ok);
@@ -235,6 +254,18 @@ mod tests {
         assert!(mac[2].ends_with("without altering line endings"));
         let linux = elevation_argv(Os::Linux, Path::new("/opt/diskdust"), "7b7d");
         assert_eq!(linux, ["pkexec", "/opt/diskdust", "helper", "7b7d"]);
+    }
+
+    #[test]
+    fn helper_executable_prefers_a_real_appimage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let image = write_file(&dir.path().join("diskdust.AppImage"), 10);
+        let exe = PathBuf::from("/tmp/.mount_abc/usr/bin/diskdust");
+        assert_eq!(helper_executable(exe.clone(), Some(image.as_os_str())), image);
+        assert_eq!(helper_executable(exe.clone(), None), exe);
+        assert_eq!(helper_executable(exe.clone(), Some(OsStr::new("relative.AppImage"))), exe);
+        assert_eq!(helper_executable(exe.clone(), Some(dir.path().join("missing").as_os_str())), exe);
+        assert_eq!(helper_executable(exe.clone(), Some(dir.path().as_os_str())), exe, "directories are refused");
     }
 
     #[test]
