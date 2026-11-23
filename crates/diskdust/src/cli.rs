@@ -20,9 +20,11 @@ pub const USAGE: &str = "usage:
   diskdust                       open the desktop app
   diskdust scan  [filters] [--json]
                                  print a read-only report
-  diskdust clean [filters] (--dry-run | --yes) [--permanent] [--json]
+  diskdust clean [filters] (--dry-run | --yes) [--include-review] [--permanent] [--json]
                                  clean matching items (moved to the Trash unless --permanent);
-                                 admin items are skipped, ignored items are never touched
+                                 Safe items only unless --include-review; the Trash is emptied
+                                 only with --category trash; admin items are skipped and
+                                 ignored items are never touched
 
 filters:
   --category <name>     repeatable: containers, developer-caches, old-toolchains, build-artifacts,
@@ -49,6 +51,8 @@ pub struct Options {
     pub older_than: Option<u64>,
     pub confirm: Option<Confirm>,
     pub mode: DeleteMode,
+    /// `clean` also takes items marked Review (they may hold data you want).
+    pub include_review: bool,
 }
 
 impl Default for Options {
@@ -60,6 +64,7 @@ impl Default for Options {
             older_than: None,
             confirm: None,
             mode: DeleteMode::Trash,
+            include_review: false,
         }
     }
 }
@@ -82,6 +87,7 @@ pub fn parse(args: &[String]) -> anyhow::Result<Options> {
             "--dry-run" => set_confirm(&mut opts, Confirm::DryRun)?,
             "--yes" | "-y" => set_confirm(&mut opts, Confirm::Yes)?,
             "--permanent" => opts.mode = DeleteMode::Permanent,
+            "--include-review" => opts.include_review = true,
             "--category" => {
                 let value = it.next().context("--category needs a value")?;
                 let category = Category::from_slug(value).with_context(|| format!("unknown category `{value}`"))?;
@@ -102,7 +108,41 @@ pub fn parse(args: &[String]) -> anyhow::Result<Options> {
     Ok(opts)
 }
 
+/// Why `clean` left a matching item out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldBack {
+    /// Marked Review and `--include-review` was not given.
+    Review,
+    /// Emptying the Trash is permanent; it needs `--category trash`.
+    Trash,
+}
+
 impl Options {
+    /// Extra conditions `clean` applies on top of [`Self::matches`]: Review items need
+    /// `--include-review`, and the Trash (always emptied permanently) must be asked for by name.
+    pub fn held_back(&self, f: &Finding) -> Option<HeldBack> {
+        if f.category == Category::Trash && !self.categories.contains(&Category::Trash) {
+            Some(HeldBack::Trash)
+        } else if f.risk == Risk::Review && !self.include_review {
+            Some(HeldBack::Review)
+        } else {
+            None
+        }
+    }
+
+    /// Splits matching actionable findings into those `clean` will take and those it holds back.
+    pub fn select_for_clean(&self, findings: Vec<Finding>, now: i64) -> (Vec<Finding>, Vec<(Finding, HeldBack)>) {
+        let mut chosen = Vec::new();
+        let mut held = Vec::new();
+        for f in findings.into_iter().filter(|f| f.is_actionable() && self.matches(f, now)) {
+            match self.held_back(&f) {
+                None => chosen.push(f),
+                Some(reason) => held.push((f, reason)),
+            }
+        }
+        (chosen, held)
+    }
+
     /// Whether `f` passes the category, risk and age filters.
     pub fn matches(&self, f: &Finding, now: i64) -> bool {
         (self.categories.is_empty() || self.categories.contains(&f.category))
@@ -157,7 +197,10 @@ pub fn clean(args: &[String]) -> anyhow::Result<()> {
     let settings = SettingsStore::default_location().load();
     let (os, home, findings) = scan_machine(&settings)?;
     let now = format::now_unix();
-    let chosen: Vec<Finding> = findings.into_iter().filter(|f| f.is_actionable() && opts.matches(f, now)).collect();
+    let (chosen, held) = opts.select_for_clean(findings, now);
+    if !opts.json && !held.is_empty() {
+        eprintln!("{}", held_back_note(&held));
+    }
     if confirm == Confirm::DryRun {
         if opts.json {
             println!("{}", serde_json::to_string_pretty(&chosen)?);
@@ -185,6 +228,20 @@ pub fn clean(args: &[String]) -> anyhow::Result<()> {
         bail!("{} not cleaned (see above; log: {})", format::items(failed), audit.path().display());
     }
     Ok(())
+}
+
+/// Explains which matching items `clean` left out and how to include them.
+fn held_back_note(held: &[(Finding, HeldBack)]) -> String {
+    let review = held.iter().filter(|(_, r)| *r == HeldBack::Review).count();
+    let trash = held.iter().any(|(_, r)| *r == HeldBack::Trash);
+    let mut parts = Vec::new();
+    if review > 0 {
+        parts.push(format!("{} marked Review (add --include-review)", format::items_are(review)));
+    }
+    if trash {
+        parts.push("the Trash is not emptied (add --category trash)".to_owned());
+    }
+    format!("not included: {}", parts.join("; "))
 }
 
 fn summary(results: &[CleanResult]) -> String {
@@ -271,6 +328,7 @@ mod tests {
             "30d",
             "--yes",
             "--permanent",
+            "--include-review",
         ]))
         .expect("parse");
         assert_eq!(
@@ -282,6 +340,7 @@ mod tests {
                 older_than: Some(30),
                 confirm: Some(Confirm::Yes),
                 mode: DeleteMode::Permanent,
+                include_review: true,
             }
         );
         assert_eq!(parse(&args(&["--dry-run", "--dry-run"])).expect("parse").confirm, Some(Confirm::DryRun));
@@ -342,5 +401,37 @@ mod tests {
         assert!(table.contains("Snapshots [admin]"));
         assert!(table.contains("info"));
         assert!(table.ends_with("3 items, 2.0 GB reclaimable\n"));
+    }
+
+    fn categorized(id: &str, category: Category, risk: Risk) -> Finding {
+        let mut f = finding(id, Some(10), true, Privilege::User);
+        f.category = category;
+        f.risk = risk;
+        f
+    }
+
+    #[test]
+    fn clean_takes_only_safe_items_and_never_the_trash_by_default() {
+        let all = vec![
+            categorized("cache", Category::DeveloperCaches, Risk::Safe),
+            categorized("volumes", Category::Containers, Risk::Review),
+            categorized("trash", Category::Trash, Risk::Safe),
+            finding("info", Some(1), false, Privilege::User),
+        ];
+        let opts = parse(&args(&["--yes"])).expect("parse");
+        let (chosen, held) = opts.select_for_clean(all.clone(), 0);
+        assert_eq!(chosen.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["cache"]);
+        let reasons: Vec<_> = held.iter().map(|(f, r)| (f.id.as_str(), *r)).collect();
+        assert_eq!(reasons, [("volumes", HeldBack::Review), ("trash", HeldBack::Trash)]);
+        assert_eq!(
+            held_back_note(&held),
+            "not included: 1 item is marked Review (add --include-review); the Trash is not emptied (add --category trash)"
+        );
+
+        let opts = parse(&args(&["--yes", "--include-review", "--category", "trash", "--category", "containers"]))
+            .expect("parse");
+        let (chosen, held) = opts.select_for_clean(all, 0);
+        assert_eq!(chosen.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["volumes", "trash"]);
+        assert!(held.is_empty());
     }
 }

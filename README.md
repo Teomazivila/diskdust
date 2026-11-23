@@ -97,7 +97,7 @@ was last modified.
 diskdust                                   # open the desktop app
 diskdust scan [filters] [--json]           # read-only report in the terminal
 diskdust clean [filters] --dry-run         # list what would be cleaned
-diskdust clean [filters] --yes [--permanent] [--json]
+diskdust clean [filters] --yes [--include-review] [--permanent] [--json]
 ```
 
 Filters: `--category <name>` (repeatable: `containers`, `developer-caches`, `old-toolchains`,
@@ -106,10 +106,17 @@ Filters: `--category <name>` (repeatable: `containers`, `developer-caches`, `old
 
 `diskdust clean` follows the same safety rules as the app: Trash by default, ignored items are never
 touched, running apps block their caches, every attempt is audited, and admin items are skipped
-(clean those from the app). It exits with status 1 when any item was not cleaned. Example:
+(clean those from the app). On top of that it is conservative by default:
+
+- only items marked **Safe** are cleaned; items marked **Review** (Docker volumes, device backups,
+  old toolchains, …) need `--include-review`;
+- the Trash is emptied (always permanently) only when you ask for it with `--category trash`.
+
+It prints which matching items it left out and why, and exits with status 1 when any item was not
+cleaned. Example:
 
 ```sh
-diskdust clean --category build-artifacts --older-than 90 --safe-only --dry-run
+diskdust clean --category build-artifacts --older-than 90 --dry-run
 ```
 
 ### macOS privacy prompts
