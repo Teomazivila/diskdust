@@ -29,7 +29,8 @@ impl Scanner for ToolchainsScanner {
     }
 
     fn scan(&self, ctx: &ScanContext<'_>) -> Result<Vec<Finding>, ScanError> {
-        let mut found = rustup(ctx)?;
+        // Each tool is independent: one failing (e.g. rustup timing out) must not hide the others.
+        let mut found = rustup(ctx);
         found.extend(nvm(ctx));
         found.extend(fnm(ctx));
         found.extend(pyenv(ctx));
@@ -62,30 +63,38 @@ fn finding(
 
 // ---- rustup -------------------------------------------------------------------------------
 
-/// Parses `rustup toolchain list`, returning toolchains that are neither default nor active.
-/// Lines look like `stable-aarch64-apple-darwin (active, default)` or `1.94.0-aarch64-apple-darwin`.
+/// Parses `rustup toolchain list`, returning toolchains that are neither default, active nor an
+/// override. Lines look like `stable-aarch64-apple-darwin (active, default)`,
+/// `1.94.0-aarch64-apple-darwin`, or (older rustup) `1.70.0-x86_64-unknown-linux-gnu (override)`.
 fn removable_rustup_toolchains(list: &str) -> Vec<String> {
     list.lines()
         .filter_map(|line| {
             let line = line.trim();
             let (name, flags) = line.split_once(' ').unwrap_or((line, ""));
-            let keep = flags.contains("default") || flags.contains("active");
+            let keep = ["default", "active", "override"].iter().any(|flag| flags.contains(flag));
             (!name.is_empty() && !keep).then(|| name.to_owned())
         })
         .collect()
 }
 
-fn rustup(ctx: &ScanContext<'_>) -> Result<Vec<Finding>, ScanError> {
+fn rustup(ctx: &ScanContext<'_>) -> Vec<Finding> {
     if !ctx.runner.exists("rustup") {
-        return Ok(Vec::new());
+        return Vec::new();
     }
     let argv: Vec<String> = ["rustup", "toolchain", "list"].iter().map(|s| (*s).to_owned()).collect();
-    let out = ctx.runner.run(&argv, Duration::from_secs(30))?;
-    if !out.success {
-        return Ok(Vec::new());
-    }
+    let out = match ctx.runner.run(&argv, Duration::from_secs(30)) {
+        Ok(out) if out.success => out,
+        Ok(out) => {
+            tracing::warn!(stderr = %out.stderr.trim(), "rustup toolchain list failed; skipping Rust toolchains");
+            return Vec::new();
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not run rustup; skipping Rust toolchains");
+            return Vec::new();
+        }
+    };
     let dir = ctx.home.join(".rustup/toolchains");
-    Ok(removable_rustup_toolchains(&out.stdout)
+    removable_rustup_toolchains(&out.stdout)
         .into_iter()
         .filter_map(|toolchain| {
             let cmd = KnownCommand::RustupUninstall { toolchain: toolchain.clone() };
@@ -103,7 +112,7 @@ fn rustup(ctx: &ScanContext<'_>) -> Result<Vec<Finding>, ScanError> {
                  projects that pin it (rust-toolchain.toml) reinstall it on their next build.",
             )
         })
-        .collect())
+        .collect()
 }
 
 // ---- Node (nvm, fnm) -----------------------------------------------------------------------
@@ -419,6 +428,10 @@ mod tests {
             ["nightly-aarch64-apple-darwin", "1.94.0-aarch64-apple-darwin", "1.95.0-aarch64-apple-darwin"]
         );
         assert!(removable_rustup_toolchains("stable-x86_64-unknown-linux-gnu (active, default)\n").is_empty());
+        assert!(
+            removable_rustup_toolchains("1.70.0-x86_64-unknown-linux-gnu (override)\n").is_empty(),
+            "older rustup marks a directory override this way"
+        );
     }
 
     #[test]
@@ -438,6 +451,18 @@ mod tests {
         assert!(found[0].last_modified.is_some());
         let failing = FakeRunner::new().respond("rustup toolchain list", false, "");
         assert!(ToolchainsScanner.scan(&env.ctx(Os::MacOs, &failing)).expect("scan").is_empty());
+    }
+
+    #[test]
+    fn rustup_failure_does_not_hide_other_toolchains() {
+        let env = Env::new();
+        env.file(".rustup/toolchains/1.94.0-aarch64-apple-darwin/lib/librustc.dylib", BIG);
+        env.file(".pyenv/versions/3.11.9/bin/python", BIG);
+        env.file(".pyenv/versions/3.12.4/bin/python", BIG);
+        std::fs::write(env.home.join(".pyenv/version"), "3.12.4\n").expect("version");
+        let runner = FakeRunner::new().time_out("rustup toolchain list");
+        let found = ToolchainsScanner.scan(&env.ctx(Os::MacOs, &runner)).expect("scan never fails");
+        assert_eq!(titles(&found), ["Python 3.11.9 (pyenv)"]);
     }
 
     #[test]
