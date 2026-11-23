@@ -23,8 +23,8 @@ pub const USAGE: &str = "usage:
   diskdust clean [filters] (--dry-run | --yes) [--include-review] [--permanent] [--json]
                                  clean matching items (moved to the Trash unless --permanent);
                                  Safe items only unless --include-review; the Trash is emptied
-                                 only with --category trash; admin items are skipped and
-                                 ignored items are never touched
+                                 only with --category trash; admin items are left to the
+                                 desktop app and ignored items are never touched
 
 filters:
   --category <name>     repeatable: containers, developer-caches, old-toolchains, build-artifacts,
@@ -115,13 +115,17 @@ pub enum HeldBack {
     Review,
     /// Emptying the Trash is permanent; it needs `--category trash`.
     Trash,
+    /// Needs the administrator password, which only the desktop app can ask for.
+    Admin,
 }
 
 impl Options {
     /// Extra conditions `clean` applies on top of [`Self::matches`]: Review items need
     /// `--include-review`, and the Trash (always emptied permanently) must be asked for by name.
     pub fn held_back(&self, f: &Finding) -> Option<HeldBack> {
-        if f.category == Category::Trash && !self.categories.contains(&Category::Trash) {
+        if f.privilege == Privilege::Admin {
+            Some(HeldBack::Admin)
+        } else if f.category == Category::Trash && !self.categories.contains(&Category::Trash) {
             Some(HeldBack::Trash)
         } else if f.risk == Risk::Review && !self.include_review {
             Some(HeldBack::Review)
@@ -242,16 +246,25 @@ pub fn clean(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// "1 item needs", "3 items need".
+fn needs(n: usize) -> String {
+    if n == 1 { "1 item needs".to_owned() } else { format!("{n} items need") }
+}
+
 /// Explains which matching items `clean` left out and how to include them.
 fn held_back_note(held: &[(Finding, HeldBack)]) -> String {
     let review = held.iter().filter(|(_, r)| *r == HeldBack::Review).count();
     let trash = held.iter().any(|(_, r)| *r == HeldBack::Trash);
+    let admin = held.iter().filter(|(_, r)| *r == HeldBack::Admin).count();
     let mut parts = Vec::new();
     if review > 0 {
         parts.push(format!("{} marked Review (add --include-review)", format::items_are(review)));
     }
     if trash {
         parts.push("the Trash is not emptied (add --category trash)".to_owned());
+    }
+    if admin > 0 {
+        parts.push(format!("{} administrator access (clean from the desktop app)", needs(admin)));
     }
     format!("not included: {}", parts.join("; "))
 }
@@ -455,5 +468,20 @@ mod tests {
             Loaded { settings: Settings::default(), problem: Some("settings.json: could not read ignored".into()) };
         let err = settings_for_clean(broken).unwrap_err().to_string();
         assert!(err.contains("refusing to clean") && err.contains("could not read ignored"), "{err}");
+    }
+
+    #[test]
+    fn admin_items_are_held_back_not_failed() {
+        let mut admin = categorized("syslogs", Category::Logs, Risk::Safe);
+        admin.privilege = Privilege::Admin;
+        let all = vec![admin, categorized("cache", Category::DeveloperCaches, Risk::Safe)];
+        let opts = parse(&args(&["--yes", "--include-review"])).expect("parse");
+        let (chosen, held) = opts.select_for_clean(all, 0);
+        assert_eq!(chosen.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["cache"]);
+        assert_eq!(held.iter().map(|(f, r)| (f.id.as_str(), *r)).collect::<Vec<_>>(), [("syslogs", HeldBack::Admin)]);
+        assert_eq!(
+            held_back_note(&held),
+            "not included: 1 item needs administrator access (clean from the desktop app)"
+        );
     }
 }

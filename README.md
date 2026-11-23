@@ -105,8 +105,9 @@ Filters: `--category <name>` (repeatable: `containers`, `developer-caches`, `old
 `orphaned-app-data`, `trash`, `system`), `--safe-only`, `--older-than <days>`.
 
 `diskdust clean` follows the same safety rules as the app: Trash by default, ignored items are never
-touched, running apps block their caches, every attempt is audited, and admin items are skipped
-(clean those from the app). On top of that it is conservative by default:
+touched, running apps block their caches and every attempt is audited. Admin items are never
+cleaned from the terminal (they need the password prompt of the desktop app); they are listed as
+not included rather than counted as failures. On top of that it is conservative by default:
 
 - only items marked **Safe** are cleaned; items marked **Review** (Docker volumes, device backups,
   old toolchains, …) need `--include-review`;
