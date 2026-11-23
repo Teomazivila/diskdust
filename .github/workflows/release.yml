@@ -16,6 +16,7 @@ on:
       - crates/diskdust/Cargo.toml
       - assets/**
       - rust-toolchain.toml
+      - scripts/fetch-appimage-tools.sh
 
 permissions:
   contents: read
@@ -33,6 +34,9 @@ jobs:
     name: verify release request
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # gh run list: CI status of the commit
     outputs:
       version: ${{ steps.check.outputs.version }}
     steps:
@@ -77,7 +81,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: macos-aarch64, os: macos-latest, formats: dmg }
+          - { name: macos-aarch64, os: macos-15, formats: dmg }
           - { name: macos-x86_64, os: macos-15-intel, formats: dmg }
           # Built on the oldest supported Ubuntu so the binaries run on glibc >= 2.35
           # (Ubuntu 22.04, Debian 12 and newer). Binaries built on 24.04 need glibc 2.39.
@@ -94,6 +98,11 @@ jobs:
       # Toolchain from rust-toolchain.toml. No build cache: release artifacts are built from scratch.
       - run: rustup show active-toolchain || rustup toolchain install
       - run: cargo install cargo-packager --version "$PACKAGER_VERSION" --locked
+      # cargo-packager would download linuxdeploy from a moving tag without a checksum; place
+      # pinned, SHA-256-verified copies in its tools folder first.
+      - name: Fetch pinned AppImage tools (Linux)
+        if: runner.os == 'Linux'
+        run: scripts/fetch-appimage-tools.sh "$(uname -m)"
       # cargo-packager resolves a relative --out-dir against the package directory.
       - run: cargo packager --release --formats "${{ matrix.formats }}" --out-dir "$GITHUB_WORKSPACE/dist"
       - name: Smoke-test the packaged binary
@@ -133,6 +142,8 @@ jobs:
     needs: [verify, build]
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    # Required reviewers for this environment are configured in the repository settings.
+    environment: release
     permissions:
       contents: write # create the tag and the release
       id-token: write # sign build provenance
@@ -173,8 +184,12 @@ jobs:
           **Verify**: \`sha256sum -c SHA256SUMS --ignore-missing\`, and the build provenance with
           \`gh attestation verify <file> --repo ${GH_REPO}\`.
           EOF
+          # Created as a draft (no public tag) and published only once every asset is uploaded, so a
+          # failed upload never leaves a half-published release or a tag that blocks a re-run.
           gh release create "v$VERSION" dist/* \
+            --draft \
             --target "$GITHUB_SHA" \
             --title "diskdust $VERSION" \
             --notes-file notes.md \
             --generate-notes
+          gh release edit "v$VERSION" --draft=false

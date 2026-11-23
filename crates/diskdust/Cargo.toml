@@ -37,7 +37,7 @@ long-description = "diskdust finds reclaimable space in Docker, ~/Library, devel
 category = "Utility"
 copyright = "Copyright © 2026 diskdust contributors"
 authors = ["diskdust contributors"]
-before-packaging-command = "cargo build --release -p diskdust"
+before-packaging-command = "cargo build --locked --release -p diskdust"
 icons = ["../../assets/icon.icns", "../../assets/icon-32.png", "../../assets/icon-128.png", "../../assets/icon-256.png", "../../assets/icon-512.png"]
 binaries = [{ path = "diskdust", main = true }]
 
