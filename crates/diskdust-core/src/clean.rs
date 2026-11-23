@@ -92,6 +92,11 @@ impl std::fmt::Debug for Cleaner<'_> {
 }
 
 impl Cleaner<'_> {
+    /// Privileged cleaners (the root helper) never change permissions; see [`Repair`].
+    const fn repair(&self) -> Repair {
+        if self.allow_admin { Repair::Never } else { Repair::MakeWritable }
+    }
+
     /// Executes one action, returning a short human summary on success.
     pub fn execute(&self, action: &CleanupAction) -> Result<String, CleanError> {
         match action {
@@ -105,7 +110,7 @@ impl Cleaner<'_> {
                         Ok("Moved to Trash".to_owned())
                     }
                     DeleteMode::Permanent => {
-                        remove(&target)?;
+                        remove(&target, self.repair())?;
                         Ok("Deleted".to_owned())
                     }
                 }
@@ -131,7 +136,9 @@ impl Cleaner<'_> {
                 Ok(m) if m.file_type().is_symlink() => {
                     fs::remove_file(&entry).map_err(|source| CleanError::Io { path: entry.clone(), source })
                 }
-                _ => self.policy.validate(&entry, &dir).map_err(CleanError::from).and_then(|p| remove(&p)),
+                _ => {
+                    self.policy.validate(&entry, &dir).map_err(CleanError::from).and_then(|p| remove(&p, self.repair()))
+                }
             };
             match result {
                 Ok(()) => removed += 1,
@@ -193,16 +200,27 @@ fn tail(text: &str, max: usize) -> String {
     }
 }
 
-/// Permanently removes a validated path. Read-only directories (e.g. Go module caches) are made
-/// writable and the removal retried once.
-fn remove(path: &Path) -> Result<(), CleanError> {
+/// Whether [`remove`] may make read-only directories writable and retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Repair {
+    /// User process: read-only folders such as Go module caches are made writable and retried.
+    /// A same-user race on the path gains nothing the user could not already do.
+    MakeWritable,
+    /// Privileged helper: never change permissions. `set_permissions` follows symlinks, so a
+    /// path swapped for a symlink between the check and the chmod would make an arbitrary file
+    /// (e.g. `/etc/sudoers`) writable as root. Root does not need it to delete anyway.
+    Never,
+}
+
+/// Permanently removes a validated path; see [`Repair`] for read-only directories.
+fn remove(path: &Path, repair: Repair) -> Result<(), CleanError> {
     let io_err = |source| CleanError::Io { path: path.to_path_buf(), source };
     let meta = fs::symlink_metadata(path).map_err(io_err)?;
     if !meta.is_dir() {
         return fs::remove_file(path).map_err(io_err);
     }
     match fs::remove_dir_all(path) {
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied && repair == Repair::MakeWritable => {
             make_dirs_writable(path);
             fs::remove_dir_all(path).map_err(io_err)
         }
@@ -298,6 +316,27 @@ pub(crate) mod tests {
         assert_eq!(cleaner(&f, &runner, &trash, DeleteMode::Permanent).execute(&action).expect("ok"), "Deleted");
         assert!(!f.root.join("app").exists());
         assert!(trash.trashed.lock().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn privileged_cleaner_never_changes_permissions() {
+        let f = fixture();
+        let ro = f.root.join("app/readonly");
+        write_file(&ro.join("f"), 10);
+        fs::set_permissions(&ro, fs::Permissions::from_mode(0o555)).expect("chmod");
+        let is_root = fs::write(ro.join("probe"), b"x").is_ok();
+        let (runner, trash) = (FakeRunner::new(), RecordingTrash::default());
+        let helper = Cleaner { allow_admin: true, ..cleaner(&f, &runner, &trash, DeleteMode::Permanent) };
+        let result = helper.execute(&CleanupAction::RemovePath { path: f.root.join("app"), root: f.root.clone() });
+        if is_root {
+            // Root deletes read-only folders without touching permissions.
+            assert!(result.is_ok());
+            return;
+        }
+        assert!(matches!(result, Err(CleanError::Io { .. })), "{result:?}");
+        let mode = fs::metadata(&ro).expect("still there").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o555, "the helper must not chmod");
+        fs::set_permissions(&ro, fs::Permissions::from_mode(0o755)).expect("cleanup");
     }
 
     #[test]
