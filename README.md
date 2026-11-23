@@ -33,7 +33,7 @@ For the terminal commands on macOS, link the binary onto your `PATH`, e.g.
 
 | Category | macOS | Linux |
 |---|---|---|
-| Containers | Unused Docker images, stopped containers, unused volumes, build cache (`docker system df`); `Docker.raw`, Lima / Colima VM disks (info) | same (Lima / Colima where installed) |
+| Containers | Each unused Docker image and volume on its own (removed with `docker image rm` / `docker volume rm`), stopped containers, build cache (`docker system df`); `Docker.raw`, Lima / Colima VM disks (info) | same (Lima / Colima where installed) |
 | App caches | `~/Library/Caches/*`, Slack / VS Code / Cursor / Discord / Chrome caches | `~/.cache/*`, Slack / VS Code / Discord / Chrome under `~/.config` |
 | Logs | `~/Library/Logs/*`, `/Library/Logs/*` 🔒 | systemd journal (`journalctl --vacuum-time=7d`) 🔒 |
 | Developer caches | Cargo, npm, pnpm, Yarn, Bun, pip, uv, Gradle, Maven, Helm, Deno, Playwright, CocoaPods, JetBrains, Terraform, minikube, Hugging Face, Ollama, Homebrew (`brew cleanup`), Go (`go clean`) | same (XDG paths) |

@@ -130,8 +130,21 @@ pub enum KnownCommand {
     AptClean,
     DnfClean,
     PacmanClean,
-    SnapRemoveRevision { name: String, revision: String },
-    RustupUninstall { toolchain: String },
+    SnapRemoveRevision {
+        name: String,
+        revision: String,
+    },
+    RustupUninstall {
+        toolchain: String,
+    },
+    /// `docker image rm <id>`; `id` is `sha256:` followed by 64 lowercase hex digits.
+    DockerRemoveImage {
+        id: String,
+    },
+    /// `docker volume rm <name>`.
+    DockerRemoveVolume {
+        name: String,
+    },
 }
 
 impl KnownCommand {
@@ -157,6 +170,12 @@ impl KnownCommand {
             }
             Self::RustupUninstall { toolchain } => {
                 return vec!["rustup".to_owned(), "toolchain".to_owned(), "uninstall".to_owned(), toolchain.clone()];
+            }
+            Self::DockerRemoveImage { id } => {
+                return vec!["docker".to_owned(), "image".to_owned(), "rm".to_owned(), id.clone()];
+            }
+            Self::DockerRemoveVolume { name } => {
+                return vec!["docker".to_owned(), "volume".to_owned(), "rm".to_owned(), name.clone()];
             }
         };
         fixed.iter().map(|s| (*s).to_owned()).collect()
@@ -193,6 +212,8 @@ impl KnownCommand {
                 is_snap_name(name) && !revision.is_empty() && revision.bytes().all(|b| b.is_ascii_digit())
             }
             Self::RustupUninstall { toolchain } => is_toolchain_name(toolchain),
+            Self::DockerRemoveImage { id } => is_docker_image_id(id),
+            Self::DockerRemoveVolume { name } => is_docker_volume_name(name),
             _ => true,
         }
     }
@@ -205,6 +226,20 @@ fn is_toolchain_name(name: &str) -> bool {
         && !name.starts_with('-')
         && !name.bytes().all(|b| b == b'.')
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+}
+
+/// `sha256:` followed by exactly 64 lowercase hex digits (what `docker system df -v` reports).
+fn is_docker_image_id(id: &str) -> bool {
+    id.strip_prefix("sha256:")
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+}
+
+/// Docker's volume name rule: `[a-zA-Z0-9][a-zA-Z0-9_.-]+`, at most 255 bytes.
+fn is_docker_volume_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    (2..=255).contains(&bytes.len())
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes.iter().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
 }
 
 fn is_snap_name(name: &str) -> bool {
@@ -334,6 +369,31 @@ mod tests {
         {
             let cmd = KnownCommand::SnapRemoveRevision { name: name.into(), revision: rev.into() };
             assert!(!cmd.is_well_formed(), "{name:?} {rev:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn docker_item_removal_is_validated() {
+        let id = format!("sha256:{}", "a1".repeat(32));
+        let image = KnownCommand::DockerRemoveImage { id: id.clone() };
+        assert_eq!(image.argv(), ["docker", "image", "rm", id.as_str()]);
+        assert!(image.is_well_formed() && !image.requires_admin() && !image.is_docker_prune());
+        let volume = KnownCommand::DockerRemoveVolume { name: "pg_data-1.x".into() };
+        assert_eq!(volume.argv(), ["docker", "volume", "rm", "pg_data-1.x"]);
+        assert!(volume.is_well_formed());
+        for bad in [
+            "",
+            "sha256:",
+            "sha256:XYZ",
+            &format!("sha256:{}", "A1".repeat(32)),
+            &format!("sha256:{}", "a".repeat(63)),
+            "--all",
+            "abc",
+        ] {
+            assert!(!KnownCommand::DockerRemoveImage { id: bad.into() }.is_well_formed(), "{bad:?}");
+        }
+        for bad in ["", "a", "-f", "--force", "_x", "a b", "a/b", "x;rm", &"a".repeat(256)] {
+            assert!(!KnownCommand::DockerRemoveVolume { name: bad.into() }.is_well_formed(), "{bad:?}");
         }
     }
 
