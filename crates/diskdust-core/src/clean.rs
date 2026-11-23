@@ -11,6 +11,7 @@ use thiserror::Error;
 
 use crate::command::{CommandError, CommandRunner};
 use crate::model::{CleanupAction, Finding, KnownCommand, RunningApp};
+use crate::mounts::MountTable;
 use crate::safety::{SafetyError, SafetyPolicy};
 
 /// Prune commands on large Docker installs can take a while.
@@ -43,6 +44,10 @@ pub enum CleanError {
         #[source]
         source: io::Error,
     },
+    #[error("{path} contains another file system mounted at {mount}; unmount it first")]
+    ContainsMount { path: PathBuf, mount: PathBuf },
+    #[error("cannot verify that nothing is mounted inside (cleaning refused): {0}")]
+    MountsUnknown(String),
     #[error("could not move {path} to Trash: {message}")]
     Trash { path: PathBuf, message: String },
     #[error("removed {removed} of {total} items; first error: {first_error}")]
@@ -80,6 +85,8 @@ pub struct Cleaner<'a> {
     pub mode: DeleteMode,
     /// Whether admin-only commands may run (true only inside the privileged helper).
     pub allow_admin: bool,
+    /// Mount points; a path that is or contains one is never removed.
+    pub mounts: &'a MountTable,
 }
 
 impl std::fmt::Debug for Cleaner<'_> {
@@ -102,6 +109,7 @@ impl Cleaner<'_> {
         match action {
             CleanupAction::RemovePath { path, root } => {
                 let target = self.policy.validate(path, root)?;
+                self.check_mounts(&target)?;
                 match self.mode {
                     DeleteMode::Trash => {
                         self.trasher
@@ -117,6 +125,17 @@ impl Cleaner<'_> {
             }
             CleanupAction::EmptyDir { path, root } => self.empty_dir(path, root),
             CleanupAction::Run(cmd) => self.run(cmd),
+        }
+    }
+
+    /// Refuses `target` if it is, or contains, a mount point, or if mounts are unknown.
+    fn check_mounts(&self, target: &Path) -> Result<(), CleanError> {
+        match self.mounts.mount_within(target) {
+            Ok(None) => Ok(()),
+            Ok(Some(mount)) => {
+                Err(CleanError::ContainsMount { path: target.to_path_buf(), mount: mount.to_path_buf() })
+            }
+            Err(why) => Err(CleanError::MountsUnknown(why.to_owned())),
         }
     }
 
@@ -136,9 +155,12 @@ impl Cleaner<'_> {
                 Ok(m) if m.file_type().is_symlink() => {
                     fs::remove_file(&entry).map_err(|source| CleanError::Io { path: entry.clone(), source })
                 }
-                _ => {
-                    self.policy.validate(&entry, &dir).map_err(CleanError::from).and_then(|p| remove(&p, self.repair()))
-                }
+                _ => self
+                    .policy
+                    .validate(&entry, &dir)
+                    .map_err(CleanError::from)
+                    .and_then(|p| self.check_mounts(&p).map(|()| p))
+                    .and_then(|p| remove(&p, self.repair())),
             };
             match result {
                 Ok(()) => removed += 1,
@@ -268,6 +290,8 @@ pub(crate) mod tests {
     use crate::scanners::testutil::write_file;
     use std::sync::Mutex;
 
+    pub(crate) static NO_MOUNTS: MountTable = MountTable::none();
+
     #[derive(Debug, Default)]
     pub(crate) struct RecordingTrash {
         pub trashed: Mutex<Vec<PathBuf>>,
@@ -298,7 +322,7 @@ pub(crate) mod tests {
     }
 
     fn cleaner<'a>(f: &'a Fixture, runner: &'a FakeRunner, trash: &'a RecordingTrash, mode: DeleteMode) -> Cleaner<'a> {
-        Cleaner { policy: &f.policy, runner, trasher: trash, mode, allow_admin: false }
+        Cleaner { policy: &f.policy, runner, trasher: trash, mode, allow_admin: false, mounts: &NO_MOUNTS }
     }
 
     #[test]
@@ -353,6 +377,44 @@ pub(crate) mod tests {
         let mode = fs::metadata(&ro).expect("still there").permissions().mode() & 0o777;
         assert_eq!(mode, 0o555, "the helper must not chmod");
         fs::set_permissions(&ro, fs::Permissions::from_mode(0o755)).expect("cleanup");
+    }
+
+    #[test]
+    fn never_removes_into_a_mounted_file_system() {
+        let f = fixture();
+        let mounted = f.root.join("app/nested-share");
+        write_file(&mounted.join("remote-file"), 10);
+        let mounts = MountTable::from_points(vec![PathBuf::from("/"), mounted.clone()]);
+        let (runner, trash) = (FakeRunner::new(), RecordingTrash::default());
+        for mode in [DeleteMode::Trash, DeleteMode::Permanent] {
+            let c = Cleaner { mounts: &mounts, ..cleaner(&f, &runner, &trash, mode) };
+            let err =
+                c.execute(&CleanupAction::RemovePath { path: f.root.join("app"), root: f.root.clone() }).unwrap_err();
+            assert!(matches!(err, CleanError::ContainsMount { .. }), "{mode:?}: {err}");
+            assert!(err.to_string().contains("unmount it first"));
+        }
+        assert!(mounted.join("remote-file").exists());
+        assert!(trash.trashed.lock().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn empty_dir_skips_mounted_children_and_unknown_mounts_fail_closed() {
+        let f = fixture();
+        let trash_dir = f.root.join("Trash");
+        write_file(&trash_dir.join("plain"), 10);
+        write_file(&trash_dir.join("share/remote-file"), 10);
+        let mounts = MountTable::from_points(vec![trash_dir.join("share")]);
+        let (runner, trash) = (FakeRunner::new(), RecordingTrash::default());
+        let c = Cleaner { mounts: &mounts, ..cleaner(&f, &runner, &trash, DeleteMode::Permanent) };
+        let err = c.execute(&CleanupAction::EmptyDir { path: trash_dir.clone(), root: f.root.clone() }).unwrap_err();
+        assert!(matches!(err, CleanError::Partial { removed: 1, total: 2, .. }), "{err}");
+        assert!(trash_dir.join("share/remote-file").exists());
+
+        let unknown = MountTable::unknown("mount failed");
+        let c = Cleaner { mounts: &unknown, ..cleaner(&f, &runner, &trash, DeleteMode::Permanent) };
+        let err = c.execute(&CleanupAction::RemovePath { path: f.root.join("app"), root: f.root.clone() }).unwrap_err();
+        assert!(matches!(err, CleanError::MountsUnknown(_)), "{err}");
+        assert!(f.root.join("app").exists());
     }
 
     #[test]
@@ -423,6 +485,7 @@ pub(crate) mod tests {
             trasher: &trash,
             mode: DeleteMode::Permanent,
             allow_admin: false,
+            mounts: &NO_MOUNTS,
         };
         let err = c.execute(&CleanupAction::EmptyDir { path: trash_dir.clone(), root: f.root.clone() }).unwrap_err();
         assert!(matches!(err, CleanError::Safety(SafetyError::Protected(_))), "{err}");

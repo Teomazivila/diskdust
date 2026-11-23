@@ -8,6 +8,7 @@ use diskdust_core::audit::{AuditEntry, AuditLog};
 use diskdust_core::clean::{Cleaner, DeleteMode, SystemTrash, quit_first_reason};
 use diskdust_core::command::{CommandRunner, SystemRunner};
 use diskdust_core::model::{CleanupAction, Finding, KnownCommand, Os, Privilege};
+use diskdust_core::mounts::MountTable;
 use diskdust_core::privilege::{
     HelperResult, describe_elevation_failure, elevation_argv, encode_payload, helper_executable, parse_helper_output,
 };
@@ -72,7 +73,9 @@ pub fn clean_findings(
 ) {
     let runner = SystemRunner::new(home);
     let policy = SafetyPolicy::for_home(home);
-    let cleaner = Cleaner { policy: &policy, runner: &runner, trasher: &SystemTrash, mode, allow_admin: false };
+    let mounts = MountTable::current(os, &runner);
+    let cleaner =
+        Cleaner { policy: &policy, runner: &runner, trasher: &SystemTrash, mode, allow_admin: false, mounts: &mounts };
     let run_id = AuditEntry::new_run_id();
     tracing::info!(run_id = %run_id, items = findings.len(), ?mode, "clean started");
     let mut report = |finding: &Finding, action: &CleanupAction, ok: bool, message: String, elevated: bool| {
