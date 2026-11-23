@@ -87,3 +87,26 @@ cargo llvm-cov --locked -p diskdust-core --fail-under-lines 80
 cargo audit --deny warnings
 cargo deny --locked check
 ```
+
+## 6. Second review (2026-11-23, `main` @ `4951cc9`)
+
+Independent reviews of the engine, the app/CLI and the CI/release workflows, after F1–F11. Delivered
+on `fix/review-2`; every fix has a regression test (or, for workflows, a local end-to-end check).
+
+| ID | Sev. | Defect | Fix | Status |
+|---|---|---|---|---|
+| D1 | High | Trash emptied mid-clean: items moved to the Trash earlier in the same run were then erased with it | Trash-emptying actions always run first | ✅ `33b1ff7` |
+| D2 | High | `clean --yes` without filters cleaned Review items (e.g. `docker volume prune`) and emptied the Trash | Safe items only unless `--include-review`; Trash only with `--category trash`; held-back items reported | ✅ `6191154` |
+| D3 | High | pyenv offered the global interpreter (virtualenv name, trailing comment, prefix such as `3.12`) | Parse the version file like pyenv, resolve to installed versions, offer nothing if unresolvable, warn about envs inside | ✅ `1c2cb27` |
+| D4 | High | One invalid field in `settings.json` reset the ignore list; CLI then cleaned ignored items, app overwrote the file | Per-field decoding; CLI refuses to clean, app backs up to `settings.json.bad` | ✅ `425dae6` |
+| D5 | High | Root helper `chmod` fallback followed symlinks (TOCTOU → arbitrary file made writable as root) | Privileged cleaner never changes permissions | ✅ `856b73d` |
+| D6 | Med | Running-app guard failed open when `pgrep` failed | Exit 1 = not running, anything else blocks (fail closed) | ✅ `6a39982` |
+| D7 | Med | GUI cleaned ignored-but-ticked items and selections hidden by filters | One clean set for button, dialog and clean; dialog lists every item and hidden count | ✅ `a60902c` |
+| D8 | Med | Linux packages needed glibc 2.39 (did not start on Ubuntu 22.04 / Debian 12) | Build on `ubuntu-22.04(-arm)`, `libc6 (>= 2.35)`, release step guards the requirement | ✅ `c5818ff` |
+| D9 | Low | `clean` always exited 1 on macOS because skipped admin items counted as failures | Admin items held back and reported, never failed | ✅ `6954d5e` |
+| D10 | Low | rustup not found from GUI launches; one rustup error dropped all toolchain results; `(override)` not kept | `~/.cargo/bin` searched; rustup errors isolated; override kept; dot-only names rejected | ✅ `4a760ab` |
+| D11 | Low | Cleaning crossed mount points; old JetBrains settings could hold scratch files | Mount table check (fail closed); folders with scratches skipped | ✅ `0dca7f4`, `7c9b093` |
+| D12 | Low | AppImage tools unpinned; release public before all assets; no approval gate; CI on `main` self-cancelled | Pinned + SHA-256-verified tools; draft-then-publish; `release` environment; misc. hardening | ✅ `5d5012e` |
+
+Owner actions: add required reviewers to the `release` environment and enable branch protection
+on `main` (R5).
