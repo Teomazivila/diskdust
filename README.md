@@ -43,6 +43,7 @@ For the terminal commands on macOS, link the binary onto your `PATH`, e.g.
 | Xcode | DerivedData, Archives, device support, simulator caches, unavailable simulators | — |
 | Device backups | iPhone/iPad backups | — |
 | Orphaned app data | `Application Support`, `Saved Application State`, `HTTPStorages`, `WebKit` folders of bundle ids with no installed app | — |
+| Large files (opt-in) | Files of 1 GB+ anywhere in your home folder that no other rule explains | same |
 | Trash | `~/.Trash` | `~/.local/share/Trash` |
 | System 🔒 | `/Library/Caches/*`, Time Machine local snapshots | APT, DNF, DNF5, pacman caches; disabled snap revisions |
 
@@ -63,6 +64,9 @@ was last modified.
 - **Details panel** (click a row): what cleaning does, the full explanation, and *Largest folders*
   inside the item.
 - **Ignore** items for good (row context menu or details panel); *Show ignored* brings them back.
+- **Find large files** (sidebar, off by default): also lists files of 1 GB+ in your home folder that
+  no other rule explains. All are *Review*; hidden folders, `.git`, `~/Library`, the Trash and photo,
+  music or VM libraries are never searched. On macOS it asks for access to Desktop, Pictures, Movies, ….
 - **Running-app guard**: Slack, VS Code, Cursor, Discord, Chrome caches and Xcode DerivedData are
   skipped while the app runs; the confirmation dialog says which apps to quit.
 - **Free space** of your home volume in the toolbar, **Empty Trash** after a Trash-mode clean, and a
@@ -101,8 +105,9 @@ diskdust clean [filters] --yes [--include-review] [--permanent] [--json]
 ```
 
 Filters: `--category <name>` (repeatable: `containers`, `developer-caches`, `old-toolchains`,
-`build-artifacts`, `installers`, `app-caches`, `logs`, `xcode`, `device-backups`,
-`orphaned-app-data`, `trash`, `system`), `--safe-only`, `--older-than <days>`.
+`build-artifacts`, `installers`, `large-files`, `app-caches`, `logs`, `xcode`, `device-backups`,
+`orphaned-app-data`, `trash`, `system`), `--safe-only`, `--older-than <days>`; `--large-files`
+also searches your home folder for large files.
 
 `diskdust clean` follows the same safety rules as the app: Trash by default, ignored items are never
 touched, running apps block their caches and every attempt is audited. Admin items are never
@@ -111,7 +116,8 @@ not included rather than counted as failures. On top of that it is conservative 
 
 - only items marked **Safe** are cleaned; items marked **Review** (Docker volumes, device backups,
   old toolchains, …) need `--include-review`;
-- the Trash is emptied (always permanently) only when you ask for it with `--category trash`.
+- the Trash is emptied (always permanently) only when you ask for it with `--category trash`, and
+  large files are cleaned only with `--category large-files`.
 
 It prints which matching items it left out and why, and exits with status 1 when any item was not
 cleaned. Example:

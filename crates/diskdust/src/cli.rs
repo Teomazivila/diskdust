@@ -11,7 +11,7 @@ use diskdust_core::command::SystemRunner;
 use diskdust_core::disk;
 use diskdust_core::model::{Category, Finding, Os, Privilege, Risk};
 use diskdust_core::scan::{ScanEvent, run_scan};
-use diskdust_core::scanners::{ScanContext, default_app_dirs, default_project_roots, default_scanners, unique_dirs};
+use diskdust_core::scanners::{ScanContext, default_app_dirs, default_project_roots, scanners_for, unique_dirs};
 
 use crate::format;
 use crate::session::{CleanResult, Elevation, clean_findings, default_audit_log};
@@ -32,7 +32,9 @@ filters:
                         installers, app-caches, logs, xcode, device-backups, orphaned-app-data,
                         trash, system
   --safe-only           only items marked Safe
-  --older-than <days>   only items untouched for at least this many days (e.g. 30 or 30d)";
+  --older-than <days>   only items untouched for at least this many days (e.g. 30 or 30d)
+  --large-files         also search your home folder for large files (cleaned only with
+                        --category large-files)";
 
 /// How `clean` was confirmed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +47,8 @@ pub enum Confirm {
 
 /// Parsed command-line options shared by `scan` and `clean`.
 #[derive(Debug, PartialEq, Eq)]
+// Independent on/off command-line switches; grouping them would not make them less independent.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Options {
     pub json: bool,
     pub categories: Vec<Category>,
@@ -54,6 +58,8 @@ pub struct Options {
     pub mode: DeleteMode,
     /// `clean` also takes items marked Review (they may hold data you want).
     pub include_review: bool,
+    /// Also search the home folder for large files (in addition to the saved setting).
+    pub large_files: bool,
 }
 
 impl Default for Options {
@@ -66,6 +72,7 @@ impl Default for Options {
             confirm: None,
             mode: DeleteMode::Trash,
             include_review: false,
+            large_files: false,
         }
     }
 }
@@ -89,6 +96,7 @@ pub fn parse(args: &[String]) -> anyhow::Result<Options> {
             "--yes" | "-y" => set_confirm(&mut opts, Confirm::Yes)?,
             "--permanent" => opts.mode = DeleteMode::Permanent,
             "--include-review" => opts.include_review = true,
+            "--large-files" => opts.large_files = true,
             "--category" => {
                 let value = it.next().context("--category needs a value")?;
                 let category = Category::from_slug(value).with_context(|| format!("unknown category `{value}`"))?;
@@ -114,11 +122,15 @@ pub fn parse(args: &[String]) -> anyhow::Result<Options> {
 pub enum HeldBack {
     /// Marked Review and `--include-review` was not given.
     Review,
-    /// Emptying the Trash is permanent; it needs `--category trash`.
-    Trash,
+    /// Must be asked for by name with `--category`: the Trash (emptying it is permanent) and
+    /// large files (personal files).
+    NeedsCategory(Category),
     /// Needs the administrator password, which only the desktop app can ask for.
     Admin,
 }
+
+/// Categories `clean` only touches when named with `--category`.
+const EXPLICIT_CATEGORIES: [Category; 2] = [Category::Trash, Category::LargeFiles];
 
 impl Options {
     /// Extra conditions `clean` applies on top of [`Self::matches`]: Review items need
@@ -126,8 +138,8 @@ impl Options {
     pub fn held_back(&self, f: &Finding) -> Option<HeldBack> {
         if f.privilege == Privilege::Admin {
             Some(HeldBack::Admin)
-        } else if f.category == Category::Trash && !self.categories.contains(&Category::Trash) {
-            Some(HeldBack::Trash)
+        } else if EXPLICIT_CATEGORIES.contains(&f.category) && !self.categories.contains(&f.category) {
+            Some(HeldBack::NeedsCategory(f.category))
         } else if f.risk == Risk::Review && !self.include_review {
             Some(HeldBack::Review)
         } else {
@@ -156,7 +168,7 @@ impl Options {
     }
 }
 
-fn scan_machine(settings: &Settings) -> anyhow::Result<(Os, PathBuf, Vec<Finding>)> {
+fn scan_machine(settings: &Settings, large_files: bool) -> anyhow::Result<(Os, PathBuf, Vec<Finding>)> {
     let os = Os::current().context("diskdust supports macOS and Linux only")?;
     let home = dirs::home_dir().context("cannot determine your home directory")?;
     let runner = SystemRunner::new(&home);
@@ -175,7 +187,7 @@ fn scan_machine(settings: &Settings) -> anyhow::Result<(Os, PathBuf, Vec<Finding
             eprintln!("warning: {name}: {error}");
         }
     };
-    let findings = run_scan(&ctx, &default_scanners(), &emit);
+    let findings = run_scan(&ctx, &scanners_for(large_files || settings.large_files), &emit);
     let findings = findings.into_iter().filter(|f| !settings.ignored.contains(&f.id)).collect();
     Ok((os, home, findings))
 }
@@ -195,7 +207,7 @@ pub fn scan(args: &[String]) -> anyhow::Result<()> {
         eprintln!("warning: {problem}; using defaults for those settings");
     }
     let settings = loaded.settings;
-    let (_, home, findings) = scan_machine(&settings)?;
+    let (_, home, findings) = scan_machine(&settings, opts.large_files)?;
     let now = format::now_unix();
     let findings: Vec<Finding> = findings.into_iter().filter(|f| opts.matches(f, now)).collect();
     if opts.json {
@@ -212,7 +224,7 @@ pub fn clean(args: &[String]) -> anyhow::Result<()> {
         bail!("pass --dry-run to preview or --yes to clean\n\n{USAGE}");
     };
     let settings = settings_for_clean(SettingsStore::default_location().load())?;
-    let (os, home, findings) = scan_machine(&settings)?;
+    let (os, home, findings) = scan_machine(&settings, opts.large_files)?;
     let now = format::now_unix();
     let (chosen, held) = opts.select_for_clean(findings, now);
     if !opts.json && !held.is_empty() {
@@ -256,7 +268,8 @@ fn needs(n: usize) -> String {
 /// Explains which matching items `clean` left out and how to include them.
 fn held_back_note(held: &[(Finding, HeldBack)]) -> String {
     let review = held.iter().filter(|(_, r)| *r == HeldBack::Review).count();
-    let trash = held.iter().any(|(_, r)| *r == HeldBack::Trash);
+    let trash = held.iter().any(|(_, r)| *r == HeldBack::NeedsCategory(Category::Trash));
+    let large = held.iter().filter(|(_, r)| *r == HeldBack::NeedsCategory(Category::LargeFiles)).count();
     let admin = held.iter().filter(|(_, r)| *r == HeldBack::Admin).count();
     let mut parts = Vec::new();
     if review > 0 {
@@ -264,6 +277,10 @@ fn held_back_note(held: &[(Finding, HeldBack)]) -> String {
     }
     if trash {
         parts.push("the Trash is not emptied (add --category trash)".to_owned());
+    }
+    if large > 0 {
+        let what = if large == 1 { "1 large file is".to_owned() } else { format!("{large} large files are") };
+        parts.push(format!("{what} not included (add --category large-files)"));
     }
     if admin > 0 {
         parts.push(format!("{} administrator access (clean from the desktop app)", needs(admin)));
@@ -371,6 +388,7 @@ mod tests {
                 confirm: Some(Confirm::Yes),
                 mode: DeleteMode::Permanent,
                 include_review: true,
+                large_files: false,
             }
         );
         assert_eq!(parse(&args(&["--dry-run", "--dry-run"])).expect("parse").confirm, Some(Confirm::DryRun));
@@ -456,7 +474,7 @@ mod tests {
         let (chosen, held) = opts.select_for_clean(all.clone(), 0);
         assert_eq!(chosen.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["cache"]);
         let reasons: Vec<_> = held.iter().map(|(f, r)| (f.id.as_str(), *r)).collect();
-        assert_eq!(reasons, [("volumes", HeldBack::Review), ("trash", HeldBack::Trash)]);
+        assert_eq!(reasons, [("volumes", HeldBack::Review), ("trash", HeldBack::NeedsCategory(Category::Trash))]);
         assert_eq!(
             held_back_note(&held),
             "not included: 1 item is marked Review (add --include-review); the Trash is not emptied (add --category trash)"
@@ -492,5 +510,17 @@ mod tests {
             held_back_note(&held),
             "not included: 1 item needs administrator access (clean from the desktop app)"
         );
+    }
+
+    #[test]
+    fn large_files_need_their_category_even_with_include_review() {
+        let movie = categorized("movie", Category::LargeFiles, Risk::Review);
+        let opts = parse(&args(&["--yes", "--include-review", "--large-files"])).expect("parse");
+        assert!(opts.large_files);
+        let (chosen, held) = opts.select_for_clean(vec![movie.clone()], 0);
+        assert!(chosen.is_empty());
+        assert_eq!(held_back_note(&held), "not included: 1 large file is not included (add --category large-files)");
+        let opts = parse(&args(&["--yes", "--include-review", "--category", "large-files"])).expect("parse");
+        assert_eq!(opts.select_for_clean(vec![movie], 0).0.len(), 1);
     }
 }

@@ -3,6 +3,7 @@
 mod artifacts;
 mod docker;
 mod installers;
+mod large_files;
 mod orphans;
 mod paths;
 mod toolchains;
@@ -23,6 +24,7 @@ use crate::size::{self, SizeReport};
 pub use artifacts::BuildArtifactsScanner;
 pub use docker::DockerScanner;
 pub use installers::InstallersScanner;
+pub use large_files::{LARGE_FILE_MIN, LargeFilesScanner};
 pub use orphans::OrphanedAppDataScanner;
 pub use paths::{Base, Mode, PathRule, PathRulesScanner, default_rules, resolved_rule_paths};
 pub use toolchains::ToolchainsScanner;
@@ -159,6 +161,15 @@ pub fn default_scanners() -> Vec<Box<dyn Scanner>> {
         Box::new(JournalScanner),
         Box::new(SnapScanner),
     ]
+}
+
+/// The built-in scanners plus the opt-in search for large files in the home folder.
+pub fn scanners_for(large_files: bool) -> Vec<Box<dyn Scanner>> {
+    let mut scanners = default_scanners();
+    if large_files {
+        scanners.push(Box::new(LargeFilesScanner::default()));
+    }
+    scanners
 }
 
 /// Appends a note when part of an item is hard-linked from elsewhere and is not freed by removing

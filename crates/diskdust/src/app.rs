@@ -11,7 +11,7 @@ use std::time::Instant;
 use diskdust_core::clean::DeleteMode;
 use diskdust_core::model::{Category, CleanupAction, Finding, Os, Privilege, Risk};
 use diskdust_core::scan::ScanEvent;
-use diskdust_core::scanners::{default_project_roots, unique_dirs};
+use diskdust_core::scanners::{LARGE_FILE_MIN, default_project_roots, unique_dirs};
 use egui::{Align, Color32, Layout, RichText, Sense, vec2};
 use egui_extras::{Column, TableBuilder};
 
@@ -80,6 +80,17 @@ struct CleanTally {
     disk_gain: Option<i64>,
 }
 
+/// Where a scan looks beyond the built-in locations.
+#[derive(Debug, Clone)]
+struct SearchScope {
+    /// Folders searched for build artifacts.
+    project_roots: Vec<PathBuf>,
+    /// True once the user changed `project_roots`; then the defaults no longer apply.
+    customized: bool,
+    /// Opt-in search for large files in the home folder.
+    large_files: bool,
+}
+
 #[derive(Debug)]
 pub struct DiskdustApp {
     os: Os,
@@ -94,7 +105,8 @@ pub struct DiskdustApp {
     ignored: std::collections::BTreeSet<String>,
     show_ignored: bool,
     /// True once the user edited the project folders (then they are persisted).
-    roots_customized: bool,
+    /// What a scan searches beyond the built-in locations.
+    scope: SearchScope,
     store: SettingsStore,
     /// Last settings written, to save only on change.
     saved: Settings,
@@ -110,7 +122,6 @@ pub struct DiskdustApp {
     /// macOS Full Disk Access as probed at start; `None` once dismissed or when not applicable.
     full_disk_access: Option<bool>,
     mode: DeleteMode,
-    project_roots: Vec<PathBuf>,
     phase: Phase,
     cancel: Arc<AtomicBool>,
     notifier: Notifier,
@@ -139,10 +150,9 @@ impl DiskdustApp {
             older_than: saved.older_than,
             ignored: saved.ignored.clone(),
             show_ignored: false,
-            roots_customized,
+            scope: SearchScope { project_roots, customized: roots_customized, large_files: saved.large_files },
             store,
             mode: saved.mode.unwrap_or(DeleteMode::Trash),
-            project_roots,
             phase: Phase::Welcome,
             cancel: Arc::new(AtomicBool::new(false)),
             notifier: Notifier::new(tx, cc.egui_ctx.clone()),
@@ -311,10 +321,11 @@ impl DiskdustApp {
 
     fn current_settings(&self) -> Settings {
         Settings {
-            project_roots: self.roots_customized.then(|| self.project_roots.clone()),
+            project_roots: self.scope.customized.then(|| self.scope.project_roots.clone()),
             mode: Some(self.mode),
             older_than: self.older_than,
             ignored: self.ignored.clone(),
+            large_files: self.scope.large_files,
         }
     }
 
@@ -324,7 +335,8 @@ impl DiskdustApp {
         let unchanged = current.project_roots == self.saved.project_roots
             && current.mode.unwrap_or(DeleteMode::Trash) == self.saved.mode.unwrap_or(DeleteMode::Trash)
             && current.older_than == self.saved.older_than
-            && current.ignored == self.saved.ignored;
+            && current.ignored == self.saved.ignored
+            && current.large_files == self.saved.large_files;
         if unchanged {
             return;
         }
@@ -492,7 +504,8 @@ impl DiskdustApp {
         worker::spawn_scan(
             self.os,
             self.home.clone(),
-            self.project_roots.clone(),
+            self.scope.project_roots.clone(),
+            self.scope.large_files,
             Arc::clone(&self.cancel),
             self.notifier.clone(),
         );
@@ -727,7 +740,7 @@ impl DiskdustApp {
         ui.label(RichText::new("Project folders").strong())
             .on_hover_text("Searched for target/, node_modules/ and other build output");
         let mut remove = None;
-        for (i, root) in self.project_roots.iter().enumerate() {
+        for (i, root) in self.scope.project_roots.iter().enumerate() {
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(!self.busy(), egui::Button::new(ICON_REMOVE).small())
@@ -741,17 +754,31 @@ impl DiskdustApp {
             });
         }
         if let Some(i) = remove {
-            self.project_roots.remove(i);
-            self.roots_customized = true;
+            self.scope.project_roots.remove(i);
+            self.scope.customized = true;
         }
         if ui.add_enabled(!self.busy(), egui::Button::new("Add folder…")).clicked()
             && let Some(folder) = rfd::FileDialog::new().set_directory(&self.home).pick_folder()
         {
-            let mut roots = self.project_roots.clone();
+            let mut roots = self.scope.project_roots.clone();
             roots.push(folder);
-            self.project_roots = unique_dirs(roots);
-            self.roots_customized = true;
+            self.scope.project_roots = unique_dirs(roots);
+            self.scope.customized = true;
         }
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_enabled(
+            !self.busy(),
+            egui::Checkbox::new(
+                &mut self.scope.large_files,
+                format!("Find large files ({}+)", format::bytes(LARGE_FILE_MIN)),
+            ),
+        )
+        .on_hover_text(
+            "Also search your home folder for large files no other rule explains (applies on the next scan). \
+             On macOS this asks for access to Desktop, Pictures, Movies and other folders. Hidden folders, \
+             Library and photo or VM libraries are never searched.",
+        );
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -806,7 +833,7 @@ impl DiskdustApp {
                 )
                 .weak(),
             );
-            if let Some(note) = privacy_prompt_note(self.os, &self.home, &self.project_roots) {
+            if let Some(note) = privacy_prompt_note(self.os, &self.home, &self.scope.project_roots) {
                 ui.add_space(8.0);
                 ui.label(RichText::new(note).small().color(INFO));
             }
@@ -1703,6 +1730,7 @@ mod tests {
                     mode: Some(DeleteMode::Permanent),
                     older_than: Some(90),
                     ignored: ["x".to_owned()].into(),
+                    large_files: true,
                 })
                 .expect("seed");
             let home_path = home.path().to_path_buf();
@@ -1713,7 +1741,7 @@ mod tests {
             let state = harness.state();
             assert_eq!(state.mode, DeleteMode::Permanent);
             assert_eq!(state.older_than, Some(90));
-            assert_eq!(state.project_roots, vec![code.canonicalize().expect("canonical")]);
+            assert_eq!(state.scope.project_roots, vec![code.canonicalize().expect("canonical")]);
             assert!(state.ignored.contains("x"));
             harness.get_by_label("Move to Trash").click();
             harness.run();
@@ -1935,7 +1963,7 @@ mod tests {
             let code = home.path().join("code");
             std::fs::create_dir_all(&code).expect("mkdir");
             let mut harness = harness(home.path());
-            harness.state_mut().project_roots = vec![code];
+            harness.state_mut().scope.project_roots = vec![code];
             harness.state_mut().log(true, "Go build cache — Done".to_owned());
             harness.state_mut().log(false, "Stale — permission denied".to_owned());
             harness.run();
@@ -1944,7 +1972,7 @@ mod tests {
             harness.get_by_label_contains("permission denied");
             harness.get_by_label(ICON_REMOVE).click();
             harness.run();
-            assert!(harness.state().project_roots.is_empty());
+            assert!(harness.state().scope.project_roots.is_empty());
             save(&mut harness, "activity");
         }
 

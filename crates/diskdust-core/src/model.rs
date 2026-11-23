@@ -40,15 +40,17 @@ pub enum Category {
     System,
     Toolchains,
     Installers,
+    LargeFiles,
 }
 
 impl Category {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Containers,
         Self::DeveloperCaches,
         Self::Toolchains,
         Self::BuildArtifacts,
         Self::Installers,
+        Self::LargeFiles,
         Self::AppCaches,
         Self::Logs,
         Self::Xcode,
@@ -72,6 +74,7 @@ impl Category {
             Self::System => "System",
             Self::Toolchains => "Old toolchains",
             Self::Installers => "Installers",
+            Self::LargeFiles => "Large files",
         }
     }
 }
@@ -285,6 +288,8 @@ impl Finding {
 pub const SPECIFIC: u8 = 0;
 /// Specificity value for generic catch-all rules.
 pub const GENERIC: u8 = 10;
+/// Specificity of catch-all searches (large files): loses to every other rule on overlap.
+pub const LOWEST: u8 = 20;
 
 #[cfg(test)]
 mod tests {

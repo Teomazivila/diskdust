@@ -20,6 +20,9 @@ pub struct Settings {
     pub older_than: Option<u32>,
     /// Finding ids hidden from results, cleaning and totals.
     pub ignored: BTreeSet<String>,
+    /// Also search the home folder for large files (opt-in: it reads personal folders, which
+    /// makes macOS ask for access to each of them).
+    pub large_files: bool,
 }
 
 /// Result of [`SettingsStore::load`].
@@ -93,6 +96,7 @@ impl SettingsStore {
             mode: field(&map, "mode", &mut bad),
             older_than: field(&map, "older_than", &mut bad),
             ignored: field(&map, "ignored", &mut bad).unwrap_or_default(),
+            large_files: field(&map, "large_files", &mut bad).unwrap_or_default(),
         };
         let problem = (!bad.is_empty()).then(|| format!("{}: could not read {}", path.display(), bad.join(", ")));
         Loaded { settings, problem }
@@ -137,6 +141,7 @@ mod tests {
             mode: Some(DeleteMode::Permanent),
             older_than: Some(30),
             ignored: ["docker:Images".to_owned()].into(),
+            large_files: true,
         };
         store.save(&settings).expect("save");
         assert_eq!(store.load(), Loaded { settings, problem: None });
