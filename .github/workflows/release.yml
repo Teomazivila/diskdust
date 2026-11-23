@@ -79,8 +79,10 @@ jobs:
         include:
           - { name: macos-aarch64, os: macos-latest, formats: dmg }
           - { name: macos-x86_64, os: macos-15-intel, formats: dmg }
-          - { name: linux-x86_64, os: ubuntu-24.04, formats: "deb,appimage" }
-          - { name: linux-aarch64, os: ubuntu-24.04-arm, formats: "deb,appimage" }
+          # Built on the oldest supported Ubuntu so the binaries run on glibc >= 2.35
+          # (Ubuntu 22.04, Debian 12 and newer). Binaries built on 24.04 need glibc 2.39.
+          - { name: linux-x86_64, os: ubuntu-22.04, formats: "deb,appimage" }
+          - { name: linux-aarch64, os: ubuntu-22.04-arm, formats: "deb,appimage" }
     runs-on: ${{ matrix.os }}
     env:
       # linuxdeploy is itself an AppImage; CI runners have no FUSE.
@@ -105,6 +107,17 @@ jobs:
           fi
           ls -la "${packages[@]}"
           ./target/release/diskdust --help
+      - name: Check the glibc requirement (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The .deb declares libc6 (>= 2.35); fail if a runner change raises the requirement.
+          needed=$(objdump -T target/release/diskdust | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
+          echo "binary needs glibc ${needed}"
+          if [ "$(printf '%s\n' "$needed" 2.35 | sort -V | tail -1)" != "2.35" ]; then
+            echo "::error::binary needs glibc ${needed}, newer than the supported 2.35"; exit 1
+          fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: diskdust-${{ matrix.name }}

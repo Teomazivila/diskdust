@@ -48,4 +48,4 @@ signing-identity = "-"
 
 [package.metadata.packager.deb]
 section = "utils"
-depends = ["libxkbcommon0", "libxkbcommon-x11-0"]
+depends = ["libc6 (>= 2.35)", "libxkbcommon0", "libxkbcommon-x11-0"]
