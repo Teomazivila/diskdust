@@ -13,6 +13,7 @@ use crate::command::{CommandError, CommandRunner};
 use crate::model::{CleanupAction, Finding, KnownCommand, RunningApp};
 use crate::mounts::MountTable;
 use crate::safety::{SafetyError, SafetyPolicy};
+use crate::scanners::same_contents;
 
 /// Prune commands on large Docker installs can take a while.
 const COMMAND_TIMEOUT: Duration = Duration::from_mins(30);
@@ -48,6 +49,8 @@ pub enum CleanError {
     ContainsMount { path: PathBuf, mount: PathBuf },
     #[error("cannot verify that nothing is mounted inside (cleaning refused): {0}")]
     MountsUnknown(String),
+    #[error("kept this copy: the original {original} is gone or no longer identical")]
+    DuplicateOriginalChanged { original: PathBuf },
     #[error("could not move {path} to Trash: {message}")]
     Trash { path: PathBuf, message: String },
     #[error("removed {removed} of {total} items; first error: {first_error}")]
@@ -109,22 +112,39 @@ impl Cleaner<'_> {
         match action {
             CleanupAction::RemovePath { path, root } => {
                 let target = self.policy.validate(path, root)?;
-                self.check_mounts(&target)?;
-                match self.mode {
-                    DeleteMode::Trash => {
-                        self.trasher
-                            .trash(&target)
-                            .map_err(|message| CleanError::Trash { path: target.clone(), message })?;
-                        Ok("Moved to Trash".to_owned())
-                    }
-                    DeleteMode::Permanent => {
-                        remove(&target, self.repair())?;
-                        Ok("Deleted".to_owned())
-                    }
+                self.remove_validated(&target)
+            }
+            CleanupAction::RemoveDuplicate { path, root, original } => {
+                let target = self.policy.validate(path, root)?;
+                // The kept copy must still exist, unchanged: never remove the last copy.
+                let kept = self
+                    .policy
+                    .validate(original, root)
+                    .map_err(|_| CleanError::DuplicateOriginalChanged { original: original.clone() })?;
+                if kept == target || !same_contents(&kept, &target).unwrap_or(false) {
+                    return Err(CleanError::DuplicateOriginalChanged { original: original.clone() });
                 }
+                self.remove_validated(&target)
             }
             CleanupAction::EmptyDir { path, root } => self.empty_dir(path, root),
             CleanupAction::Run(cmd) => self.run(cmd),
+        }
+    }
+
+    /// Removes an already validated path according to the delete mode.
+    fn remove_validated(&self, target: &Path) -> Result<String, CleanError> {
+        self.check_mounts(target)?;
+        match self.mode {
+            DeleteMode::Trash => {
+                self.trasher
+                    .trash(target)
+                    .map_err(|message| CleanError::Trash { path: target.to_path_buf(), message })?;
+                Ok("Moved to Trash".to_owned())
+            }
+            DeleteMode::Permanent => {
+                remove(target, self.repair())?;
+                Ok("Deleted".to_owned())
+            }
         }
     }
 
@@ -415,6 +435,35 @@ pub(crate) mod tests {
         let err = c.execute(&CleanupAction::RemovePath { path: f.root.join("app"), root: f.root.clone() }).unwrap_err();
         assert!(matches!(err, CleanError::MountsUnknown(_)), "{err}");
         assert!(f.root.join("app").exists());
+    }
+
+    #[test]
+    fn duplicates_are_removed_only_while_an_identical_original_exists() {
+        let f = fixture();
+        let original = write_file(&f.root.join("dl/report.pdf"), 4096);
+        let copy = write_file(&f.root.join("dl/report (1).pdf"), 4096);
+        let action =
+            CleanupAction::RemoveDuplicate { path: copy.clone(), root: f.root.clone(), original: original.clone() };
+        let (runner, trash) = (FakeRunner::new(), RecordingTrash::default());
+        let c = cleaner(&f, &runner, &trash, DeleteMode::Permanent);
+
+        fs::write(&original, vec![9u8; 4096]).expect("change the original");
+        let err = c.execute(&action).unwrap_err();
+        assert!(matches!(err, CleanError::DuplicateOriginalChanged { .. }), "{err}");
+        assert!(copy.exists(), "a copy whose original changed is kept");
+
+        fs::remove_file(&original).expect("original gone");
+        assert!(matches!(c.execute(&action), Err(CleanError::DuplicateOriginalChanged { .. })));
+        assert!(copy.exists(), "the last copy is never removed");
+
+        fs::write(&original, vec![7u8; 4096]).expect("identical again");
+        assert_eq!(c.execute(&action).expect("removed"), "Deleted");
+        assert!(!copy.exists() && original.exists());
+
+        let self_dup =
+            CleanupAction::RemoveDuplicate { path: original.clone(), root: f.root.clone(), original: original.clone() };
+        assert!(c.execute(&self_dup).is_err(), "a file is never its own original");
+        assert!(original.exists());
     }
 
     #[test]

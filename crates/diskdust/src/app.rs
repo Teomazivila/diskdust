@@ -1222,7 +1222,8 @@ fn age_filter_label(days: Option<u32>) -> String {
 /// Items that bypass the Trash even in Trash mode: emptying a trash folder, tool commands
 /// (Docker, Homebrew, …) and admin items run by the privileged helper.
 fn removed_permanently_in_trash_mode(f: &Finding) -> bool {
-    f.privilege == Privilege::Admin || !matches!(f.action, Some(CleanupAction::RemovePath { .. }))
+    f.privilege == Privilege::Admin
+        || !matches!(f.action, Some(CleanupAction::RemovePath { .. } | CleanupAction::RemoveDuplicate { .. }))
 }
 
 /// "2 items are removed permanently, not moved to the Trash: A, B." (at most 4 names).
@@ -1366,6 +1367,14 @@ fn action_description(f: &Finding, mode: DeleteMode) -> String {
             DeleteMode::Trash => "Moved to the Trash.".to_owned(),
             DeleteMode::Permanent => "Deleted permanently.".to_owned(),
         },
+        Some(CleanupAction::RemoveDuplicate { original, .. }) => format!(
+            "{} only if {} still exists with identical contents (checked just before).",
+            match mode {
+                DeleteMode::Trash => "Moved to the Trash",
+                DeleteMode::Permanent => "Deleted permanently",
+            },
+            original.display()
+        ),
     }
 }
 

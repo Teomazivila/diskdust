@@ -42,10 +42,11 @@ pub enum Category {
     Installers,
     LargeFiles,
     Custom,
+    Duplicates,
 }
 
 impl Category {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::Containers,
         Self::DeveloperCaches,
         Self::Toolchains,
@@ -53,6 +54,7 @@ impl Category {
         Self::Installers,
         Self::LargeFiles,
         Self::Custom,
+        Self::Duplicates,
         Self::AppCaches,
         Self::Logs,
         Self::Xcode,
@@ -78,6 +80,7 @@ impl Category {
             Self::Installers => "Installers",
             Self::LargeFiles => "Large files",
             Self::Custom => "Your rules",
+            Self::Duplicates => "Duplicates",
         }
     }
 }
@@ -263,6 +266,9 @@ pub enum CleanupAction {
     EmptyDir { path: PathBuf, root: PathBuf },
     /// Run one of the fixed, known commands.
     Run(KnownCommand),
+    /// Remove `path` (Trash or permanently) only if `original` still exists with identical
+    /// contents; both must lie inside `root`. Used for duplicate files.
+    RemoveDuplicate { path: PathBuf, root: PathBuf, original: PathBuf },
 }
 
 /// An app that must not be running while its data is cleaned (e.g. Slack for its cache).

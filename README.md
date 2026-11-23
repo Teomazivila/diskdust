@@ -44,6 +44,7 @@ For the terminal commands on macOS, link the binary onto your `PATH`, e.g.
 | Device backups | iPhone/iPad backups | — |
 | Orphaned app data | `Application Support`, `Saved Application State`, `HTTPStorages`, `WebKit` folders of bundle ids with no installed app | — |
 | Large files (opt-in) | Files of 1 GB+ anywhere in your home folder that no other rule explains | same |
+| Duplicates | Identical files in `~/Downloads` (byte-for-byte); the oldest copy is kept | same |
 | Trash | `~/.Trash` | `~/.local/share/Trash` |
 | System 🔒 | `/Library/Caches/*`, Time Machine local snapshots | APT, DNF, DNF5, pacman caches; disabled snap revisions |
 
@@ -111,6 +112,9 @@ folder (`~/Documents` itself, `~/.ssh`, …) or a path outside your home is skip
   absolute, exist, not be a symlink, lie strictly inside its declared root after resolving
   symlinks, and must not be (or contain) a protected location (`/`, `$HOME`, `/System`, `/usr`,
   `~/Documents`, `~/.ssh`, …). Walks never follow symlinks or cross file systems.
+- **Duplicates keep one copy.** A duplicate is removed only if its kept copy still exists with
+  identical contents (checked byte for byte just before), and duplicates run last in a clean, so
+  removing the original in the same clean keeps the copy.
 - **No arbitrary commands.** External tools run from a closed list of fixed argument vectors;
   arguments derived from scanned data (snap names, rustup toolchain names) are validated.
 - **The GUI never runs as root.** Admin items are passed (hex-encoded, typed) to
@@ -133,7 +137,7 @@ diskdust clean [filters] --yes [--include-review] [--permanent] [--json]
 ```
 
 Filters: `--category <name>` (repeatable: `containers`, `developer-caches`, `old-toolchains`,
-`build-artifacts`, `installers`, `large-files`, `your-rules`, `app-caches`, `logs`, `xcode`, `device-backups`,
+`build-artifacts`, `installers`, `large-files`, `your-rules`, `duplicates`, `app-caches`, `logs`, `xcode`, `device-backups`,
 `orphaned-app-data`, `trash`, `system`), `--safe-only`, `--older-than <days>`; `--large-files`
 also searches your home folder for large files.
 

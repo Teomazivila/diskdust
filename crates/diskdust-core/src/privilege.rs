@@ -90,6 +90,7 @@ pub fn validate_admin_action(action: &CleanupAction, roots: &[PathBuf]) -> Resul
         }
         CleanupAction::Run(cmd) if cmd.requires_admin() && cmd.is_well_formed() => Ok(()),
         CleanupAction::Run(_) => Err("command is not an allowed admin command".to_owned()),
+        CleanupAction::RemoveDuplicate { .. } => Err("duplicate files are never cleaned as administrator".to_owned()),
     }
 }
 

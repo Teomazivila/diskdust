@@ -3,6 +3,7 @@
 mod artifacts;
 mod custom;
 mod docker;
+mod duplicates;
 mod installers;
 mod large_files;
 mod orphans;
@@ -25,6 +26,7 @@ use crate::size::{self, SizeReport};
 pub use artifacts::BuildArtifactsScanner;
 pub use custom::{CustomMode, CustomRisk, CustomRule, CustomRulesScanner};
 pub use docker::DockerScanner;
+pub use duplicates::{DuplicatesScanner, same_contents};
 pub use installers::InstallersScanner;
 pub use large_files::{LARGE_FILE_MIN, LargeFilesScanner};
 pub use orphans::OrphanedAppDataScanner;
@@ -158,6 +160,7 @@ pub fn default_scanners() -> Vec<Box<dyn Scanner>> {
         Box::new(BuildArtifactsScanner),
         Box::new(ToolchainsScanner),
         Box::new(InstallersScanner),
+        Box::new(DuplicatesScanner),
         Box::new(VmDisksScanner),
         Box::new(TimeMachineScanner),
         Box::new(JournalScanner),

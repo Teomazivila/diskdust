@@ -35,7 +35,10 @@ pub fn trashed_in_run(entries: &[AuditEntry], run_id: &str) -> Vec<Trashed> {
         .iter()
         .filter(|e| e.run_id == run_id && e.ok && !e.elevated && e.mode == DeleteMode::Trash)
         .filter_map(|e| {
-            let CleanupAction::RemovePath { path, .. } = &e.action else { return None };
+            let (CleanupAction::RemovePath { path, .. } | CleanupAction::RemoveDuplicate { path, .. }) = &e.action
+            else {
+                return None;
+            };
             let when = OffsetDateTime::parse(&e.timestamp, &Rfc3339).ok()?.unix_timestamp();
             Some(Trashed { title: e.title.clone(), path: path.clone(), when })
         })
