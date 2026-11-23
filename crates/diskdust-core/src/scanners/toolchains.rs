@@ -5,6 +5,7 @@
 //! project. The version each manager treats as the default is always kept.
 
 use std::collections::{BTreeMap, HashSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -230,27 +231,87 @@ fn fnm(ctx: &ScanContext<'_>) -> Vec<Finding> {
 
 // ---- pyenv ---------------------------------------------------------------------------------
 
+/// Version names selected in a pyenv `version` file: whitespace-separated, `#` starts a
+/// comment, `system` means the OS Python.
+fn pyenv_selected(text: &str) -> Vec<String> {
+    text.lines()
+        .flat_map(|line| line.split('#').next().unwrap_or_default().split_whitespace())
+        .filter(|name| *name != "system")
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Installed versions that the selected names depend on, or `None` when a name cannot be
+/// resolved (then nothing is offered: a wrong guess would delete the Python you use).
+///
+/// - an installed version keeps itself;
+/// - a pyenv-virtualenv name (`versions/<env>` → `versions/<base>/envs/<env>`) keeps its base;
+/// - a prefix such as `3.12`, which pyenv resolves to an installed `3.12.x`, keeps every match.
+fn pyenv_keep(versions_dir: &Path, installed: &[String], selected: &[String]) -> Option<HashSet<String>> {
+    let canonical_versions = versions_dir.canonicalize().ok()?;
+    let mut keep = HashSet::new();
+    for name in selected {
+        let before = keep.len();
+        if let Ok(resolved) = versions_dir.join(name).canonicalize()
+            && let Ok(rel) = resolved.strip_prefix(&canonical_versions)
+            && let Some(base) = rel.components().next()
+        {
+            keep.insert(base.as_os_str().to_string_lossy().into_owned());
+        }
+        keep.extend(
+            installed
+                .iter()
+                .filter(|v| v.starts_with(&format!("{name}.")) || v.starts_with(&format!("{name}-")))
+                .cloned(),
+        );
+        if keep.len() == before && !keep.contains(name) {
+            tracing::warn!(version = %name, "pyenv version is not installed; not offering any pyenv version");
+            return None;
+        }
+    }
+    Some(keep)
+}
+
+/// Names of the pyenv-virtualenv environments stored inside an installed version.
+fn pyenv_envs(version: &Path) -> Vec<String> {
+    children(&version.join("envs")).iter().map(|p| file_name(p)).collect()
+}
+
 fn pyenv(ctx: &ScanContext<'_>) -> Vec<Finding> {
     let root = ctx.home.join(".pyenv");
     let versions_dir = root.join("versions");
-    let global: HashSet<String> = std::fs::read_to_string(root.join("version"))
-        .unwrap_or_default()
-        .lines()
-        .map(|l| l.trim().to_owned())
-        .filter(|l| !l.is_empty())
-        .collect();
-    version_dirs(&versions_dir)
+    let versions = version_dirs(&versions_dir);
+    if versions.is_empty() {
+        return Vec::new();
+    }
+    let installed: Vec<String> = versions.iter().map(|(n, _)| n.clone()).collect();
+    let selected = pyenv_selected(&std::fs::read_to_string(root.join("version")).unwrap_or_default());
+    let Some(keep) = pyenv_keep(&versions_dir, &installed, &selected) else {
+        return Vec::new();
+    };
+    versions
         .iter()
-        .filter(|(name, _)| !global.contains(name))
+        .filter(|(name, _)| !keep.contains(name))
         .filter_map(|(name, path)| {
+            let mut detail = "Python installed with pyenv that is not your global version. Projects may still select \
+                              it with a .python-version file; reinstall with `pyenv install`."
+                .to_owned();
+            let envs = pyenv_envs(path);
+            if !envs.is_empty() {
+                let _ = write!(
+                    detail,
+                    " It also contains {} virtualenv(s) that are deleted with it: {}.",
+                    envs.len(),
+                    envs.join(", ")
+                );
+            }
             finding(
                 ctx,
                 format!("toolchains:pyenv:{name}"),
                 format!("Python {name} (pyenv)"),
                 path,
                 CleanupAction::RemovePath { path: path.clone(), root: versions_dir.clone() },
-                "Python installed with pyenv that is not your global version. Projects may still select it with \
-                 a .python-version file; reinstall with `pyenv install`.",
+                &detail,
             )
         })
         .collect()
@@ -439,6 +500,61 @@ mod tests {
         let runner = FakeRunner::new();
         let found = ToolchainsScanner.scan(&env.ctx(Os::MacOs, &runner)).expect("scan");
         assert_eq!(titles(&found), ["Python 3.11.9 (pyenv)"]);
+    }
+
+    fn pyenv_versions(env: &Env, versions: &[&str], version_file: &str) -> Vec<Finding> {
+        for v in versions {
+            env.file(&format!(".pyenv/versions/{v}/bin/python"), BIG);
+        }
+        std::fs::write(env.home.join(".pyenv/version"), version_file).expect("version");
+        let runner = FakeRunner::new();
+        ToolchainsScanner.scan(&env.ctx(Os::MacOs, &runner)).expect("scan")
+    }
+
+    #[test]
+    fn pyenv_global_virtualenv_keeps_its_base_version() {
+        let env = Env::new();
+        env.file(".pyenv/versions/3.11.9/envs/work/bin/python", BIG);
+        std::os::unix::fs::symlink(
+            env.home.join(".pyenv/versions/3.11.9/envs/work"),
+            env.home.join(".pyenv/versions/work"),
+        )
+        .expect("symlink");
+        let found = pyenv_versions(&env, &["3.11.9", "3.12.4"], "work\n");
+        assert_eq!(titles(&found), ["Python 3.12.4 (pyenv)"], "3.11.9 hosts the global virtualenv");
+    }
+
+    #[test]
+    fn pyenv_version_file_comments_and_prefixes() {
+        let env = Env::new();
+        let found = pyenv_versions(&env, &["3.11.9", "3.12.4"], "3.12.4 # main interpreter\n");
+        assert_eq!(titles(&found), ["Python 3.11.9 (pyenv)"]);
+        let env = Env::new();
+        let found = pyenv_versions(&env, &["3.11.9", "3.12.1", "3.12.4"], "3.12\n");
+        assert_eq!(titles(&found), ["Python 3.11.9 (pyenv)"], "every 3.12.x is kept for prefix 3.12");
+        let env = Env::new();
+        let found = pyenv_versions(&env, &["3.11.9", "3.12.4"], "system\n# only comments\n");
+        assert_eq!(titles(&found).len(), 2, "system Python selects no pyenv version");
+    }
+
+    #[test]
+    fn pyenv_offers_nothing_when_global_cannot_be_resolved() {
+        let env = Env::new();
+        let found = pyenv_versions(&env, &["3.11.9", "3.12.4"], "3.10.2\n");
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn pyenv_warns_about_virtualenvs_inside_a_version() {
+        let env = Env::new();
+        env.file(".pyenv/versions/3.11.9/envs/old-project/bin/python", BIG);
+        let found = pyenv_versions(&env, &["3.11.9", "3.12.4"], "3.12.4\n");
+        assert_eq!(titles(&found), ["Python 3.11.9 (pyenv)"]);
+        assert!(
+            found[0].detail.contains("1 virtualenv(s) that are deleted with it: old-project"),
+            "{}",
+            found[0].detail
+        );
     }
 
     #[test]
