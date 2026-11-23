@@ -16,7 +16,7 @@ use egui::{Align, Color32, Layout, RichText, Sense, vec2};
 use egui_extras::{Column, TableBuilder};
 
 use crate::format;
-use crate::settings::{Settings, SettingsStore};
+use crate::settings::{Loaded, Settings, SettingsStore};
 use crate::worker::{self, CleanResult, Msg, Notifier};
 
 const SAFE: Color32 = Color32::from_rgb(102, 187, 106);
@@ -124,7 +124,7 @@ impl DiskdustApp {
     pub fn new(cc: &eframe::CreationContext<'_>, os: Os, home: PathBuf, store: SettingsStore) -> Self {
         configure_style(&cc.egui_ctx);
         let (tx, rx) = channel();
-        let saved = store.load();
+        let Loaded { settings: saved, problem: settings_problem } = store.load();
         let roots_customized = saved.project_roots.is_some();
         let project_roots = saved.project_roots.clone().map_or_else(|| default_project_roots(&home), unique_dirs);
         Self {
@@ -159,6 +159,20 @@ impl DiskdustApp {
         }
         .with_disk_space()
         .with_access_probe()
+        .with_settings_problem(settings_problem)
+    }
+
+    /// Keeps an unreadable settings file safe before anything is saved over it, and says so.
+    fn with_settings_problem(mut self, problem: Option<String>) -> Self {
+        let Some(problem) = problem else { return self };
+        let backup = match self.store.back_up() {
+            Ok(Some(path)) => format!(" A copy was saved to {}.", path.display()),
+            Ok(None) => String::new(),
+            Err(e) => format!(" Could not back it up: {e}."),
+        };
+        self.status = format!("Some settings could not be read and were reset.{backup}");
+        self.log(false, format!("{problem}.{backup}"));
+        self
     }
 
     fn with_access_probe(mut self) -> Self {
@@ -1628,9 +1642,33 @@ mod tests {
             assert!(state.ignored.contains("x"));
             harness.get_by_label("Move to Trash").click();
             harness.run();
-            let saved = SettingsStore::at(path).load();
+            let saved = SettingsStore::at(path).load().settings;
             assert_eq!(saved.mode, Some(DeleteMode::Trash));
             assert_eq!(saved.older_than, Some(90));
+        }
+
+        #[test]
+        fn unreadable_settings_are_backed_up_before_being_overwritten() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let path = home.path().join("config/settings.json");
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            let original = br#"{"ignored": "not-a-list", "older_than": 30}"#;
+            std::fs::write(&path, original).expect("write");
+            let store = SettingsStore::at(path.clone());
+            let home_path = home.path().to_path_buf();
+            let mut harness = Harness::builder()
+                .with_size(vec2(1200.0, 760.0))
+                .build_eframe(move |cc| DiskdustApp::new(cc, Os::current().expect("os"), home_path, store));
+            harness.run();
+            assert_eq!(harness.state().older_than, Some(30), "readable fields are kept");
+            assert!(harness.state().status.starts_with("Some settings could not be read"));
+            harness.get_by_label("Delete permanently").click();
+            harness.run();
+            let backup = path.with_extension("json.bad");
+            assert_eq!(std::fs::read(&backup).expect("backup kept"), original);
+            let saved = SettingsStore::at(path).load();
+            assert_eq!(saved.problem, None, "the new file is valid");
+            assert_eq!(saved.settings.older_than, Some(30));
         }
 
         #[test]

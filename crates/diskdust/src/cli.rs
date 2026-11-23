@@ -14,7 +14,7 @@ use diskdust_core::scanners::{ScanContext, default_app_dirs, default_project_roo
 
 use crate::format;
 use crate::session::{CleanResult, Elevation, clean_findings, default_audit_log};
-use crate::settings::{Settings, SettingsStore};
+use crate::settings::{Loaded, Settings, SettingsStore};
 
 pub const USAGE: &str = "usage:
   diskdust                       open the desktop app
@@ -175,9 +175,21 @@ fn scan_machine(settings: &Settings) -> anyhow::Result<(Os, PathBuf, Vec<Finding
     Ok((os, home, findings))
 }
 
+/// Settings for `clean`, which must honour the ignore list: refuses when the file could not be read.
+fn settings_for_clean(loaded: Loaded) -> anyhow::Result<Settings> {
+    if let Some(problem) = loaded.problem {
+        bail!("{problem}\nrefusing to clean: ignored items might not be respected. Fix or delete the settings file.");
+    }
+    Ok(loaded.settings)
+}
+
 pub fn scan(args: &[String]) -> anyhow::Result<()> {
     let opts = parse(args)?;
-    let settings = SettingsStore::default_location().load();
+    let loaded = SettingsStore::default_location().load();
+    if let Some(problem) = &loaded.problem {
+        eprintln!("warning: {problem}; using defaults for those settings");
+    }
+    let settings = loaded.settings;
     let (_, home, findings) = scan_machine(&settings)?;
     let now = format::now_unix();
     let findings: Vec<Finding> = findings.into_iter().filter(|f| opts.matches(f, now)).collect();
@@ -194,7 +206,7 @@ pub fn clean(args: &[String]) -> anyhow::Result<()> {
     let Some(confirm) = opts.confirm else {
         bail!("pass --dry-run to preview or --yes to clean\n\n{USAGE}");
     };
-    let settings = SettingsStore::default_location().load();
+    let settings = settings_for_clean(SettingsStore::default_location().load())?;
     let (os, home, findings) = scan_machine(&settings)?;
     let now = format::now_unix();
     let (chosen, held) = opts.select_for_clean(findings, now);
@@ -433,5 +445,15 @@ mod tests {
         let (chosen, held) = opts.select_for_clean(all, 0);
         assert_eq!(chosen.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["volumes", "trash"]);
         assert!(held.is_empty());
+    }
+
+    #[test]
+    fn clean_refuses_unreadable_settings() {
+        let ok = Loaded { settings: Settings { older_than: Some(3), ..Settings::default() }, problem: None };
+        assert_eq!(settings_for_clean(ok).expect("ok").older_than, Some(3));
+        let broken =
+            Loaded { settings: Settings::default(), problem: Some("settings.json: could not read ignored".into()) };
+        let err = settings_for_clean(broken).unwrap_err().to_string();
+        assert!(err.contains("refusing to clean") && err.contains("could not read ignored"), "{err}");
     }
 }
