@@ -71,6 +71,7 @@ impl SystemRunner {
             PathBuf::from("/bin"),
             PathBuf::from("/usr/sbin"),
             PathBuf::from("/sbin"),
+            home.join(".cargo/bin"),
             home.join(".docker/bin"),
             home.join(".orbstack/bin"),
             home.join("go/bin"),
@@ -174,6 +175,7 @@ pub(crate) mod fake {
     #[derive(Debug, Default)]
     pub struct FakeRunner {
         responses: HashMap<String, CommandOutput>,
+        timeouts: Vec<String>,
         installed: Vec<String>,
         pub calls: Mutex<Vec<String>>,
     }
@@ -184,6 +186,25 @@ pub(crate) mod fake {
         }
 
         /// Registers `program` as installed and scripts the output for the exact command line.
+        /// Registers `cmdline`'s program as installed and makes the command time out.
+        pub fn time_out(mut self, cmdline: &str) -> Self {
+            let program = cmdline.split_whitespace().next().unwrap_or_default().to_owned();
+            if !self.installed.contains(&program) {
+                self.installed.push(program);
+            }
+            self.timeouts.push(cmdline.to_owned());
+            self
+        }
+
+        /// Like [`Self::respond`] with an explicit exit code (0 = success).
+        pub fn respond_code(self, cmdline: &str, code: i32, stdout: &str) -> Self {
+            let mut runner = self.respond(cmdline, code == 0, stdout);
+            if let Some(out) = runner.responses.get_mut(cmdline) {
+                out.code = Some(code);
+            }
+            runner
+        }
+
         pub fn respond(mut self, cmdline: &str, success: bool, stdout: &str) -> Self {
             let program = cmdline.split_whitespace().next().unwrap_or_default().to_owned();
             if !self.installed.contains(&program) {
@@ -208,12 +229,15 @@ pub(crate) mod fake {
     }
 
     impl CommandRunner for FakeRunner {
-        fn run(&self, argv: &[String], _timeout: Duration) -> Result<CommandOutput, CommandError> {
+        fn run(&self, argv: &[String], timeout: Duration) -> Result<CommandOutput, CommandError> {
             let line = argv.join(" ");
             self.calls.lock().expect("lock").push(line.clone());
             let program = argv.first().ok_or(CommandError::Empty)?;
             if !self.exists(program) {
                 return Err(CommandError::NotFound(program.clone()));
+            }
+            if self.timeouts.contains(&line) {
+                return Err(CommandError::TimedOut { program: program.clone(), timeout });
             }
             Ok(self.responses.get(&line).cloned().unwrap_or(CommandOutput {
                 success: true,
@@ -249,6 +273,15 @@ mod tests {
         assert_eq!(out.code, Some(3));
         assert_eq!(out.stdout.trim(), "hi");
         assert_eq!(out.stderr.trim(), "err");
+    }
+
+    #[test]
+    fn user_tool_folders_are_searched_when_launched_from_a_gui() {
+        // Finder and desktop launchers give apps a minimal PATH; rustup lives in ~/.cargo/bin.
+        let runner = SystemRunner::new(Path::new("/home/u"));
+        for dir in ["/home/u/.cargo/bin", "/opt/homebrew/bin", "/home/u/.docker/bin"] {
+            assert!(runner.search_path.contains(&PathBuf::from(dir)), "{dir}");
+        }
     }
 
     #[test]

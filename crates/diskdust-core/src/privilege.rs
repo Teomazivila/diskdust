@@ -15,6 +15,7 @@ use thiserror::Error;
 use crate::clean::{Cleaner, DeleteMode, Trasher};
 use crate::command::CommandRunner;
 use crate::model::{CleanupAction, Os};
+use crate::mounts::MountTable;
 use crate::safety::SafetyPolicy;
 
 /// Subcommand used to invoke the helper.
@@ -101,7 +102,9 @@ pub fn run_helper(
 ) -> Result<Vec<HelperResult>, PayloadError> {
     let actions = decode_payload(payload)?;
     let policy = SafetyPolicy::system();
-    let cleaner = Cleaner { policy: &policy, runner, trasher, mode: DeleteMode::Permanent, allow_admin: true };
+    let mounts = MountTable::current(Os::current().unwrap_or(Os::Linux), runner);
+    let cleaner =
+        Cleaner { policy: &policy, runner, trasher, mode: DeleteMode::Permanent, allow_admin: true, mounts: &mounts };
     Ok(actions
         .iter()
         .map(|action| {
@@ -218,7 +221,7 @@ mod tests {
             CleanupAction::RemovePath { path: outside.clone(), root: dir.path().join("keep") },
             CleanupAction::Run(KnownCommand::BrewCleanup),
         ];
-        let runner = FakeRunner::new().installed("brew");
+        let runner = FakeRunner::new().installed("brew").respond("mount", true, "/dev/disk3s1 on / (apfs, local)\n");
         let results = run_helper(
             &encode_payload(&actions).expect("encode"),
             std::slice::from_ref(&root),
@@ -231,7 +234,8 @@ mod tests {
         assert!(!results[1].ok);
         assert!(outside.exists());
         assert!(!results[2].ok);
-        assert!(runner.calls.lock().expect("lock").is_empty());
+        let calls = runner.calls.lock().expect("lock").clone();
+        assert!(calls.iter().all(|c| c == "mount"), "the refused brew command must never run: {calls:?}");
         assert!(run_helper("xyz", &[], &runner, &RecordingTrash::default()).is_err());
     }
 

@@ -11,6 +11,7 @@ pub mod clean;
 pub mod command;
 pub mod disk;
 pub mod model;
+pub mod mounts;
 pub mod privilege;
 pub mod safety;
 pub mod scan;

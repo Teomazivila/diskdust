@@ -5,6 +5,7 @@
 //! project. The version each manager treats as the default is always kept.
 
 use std::collections::{BTreeMap, HashSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -28,7 +29,8 @@ impl Scanner for ToolchainsScanner {
     }
 
     fn scan(&self, ctx: &ScanContext<'_>) -> Result<Vec<Finding>, ScanError> {
-        let mut found = rustup(ctx)?;
+        // Each tool is independent: one failing (e.g. rustup timing out) must not hide the others.
+        let mut found = rustup(ctx);
         found.extend(nvm(ctx));
         found.extend(fnm(ctx));
         found.extend(pyenv(ctx));
@@ -61,30 +63,38 @@ fn finding(
 
 // ---- rustup -------------------------------------------------------------------------------
 
-/// Parses `rustup toolchain list`, returning toolchains that are neither default nor active.
-/// Lines look like `stable-aarch64-apple-darwin (active, default)` or `1.94.0-aarch64-apple-darwin`.
+/// Parses `rustup toolchain list`, returning toolchains that are neither default, active nor an
+/// override. Lines look like `stable-aarch64-apple-darwin (active, default)`,
+/// `1.94.0-aarch64-apple-darwin`, or (older rustup) `1.70.0-x86_64-unknown-linux-gnu (override)`.
 fn removable_rustup_toolchains(list: &str) -> Vec<String> {
     list.lines()
         .filter_map(|line| {
             let line = line.trim();
             let (name, flags) = line.split_once(' ').unwrap_or((line, ""));
-            let keep = flags.contains("default") || flags.contains("active");
+            let keep = ["default", "active", "override"].iter().any(|flag| flags.contains(flag));
             (!name.is_empty() && !keep).then(|| name.to_owned())
         })
         .collect()
 }
 
-fn rustup(ctx: &ScanContext<'_>) -> Result<Vec<Finding>, ScanError> {
+fn rustup(ctx: &ScanContext<'_>) -> Vec<Finding> {
     if !ctx.runner.exists("rustup") {
-        return Ok(Vec::new());
+        return Vec::new();
     }
     let argv: Vec<String> = ["rustup", "toolchain", "list"].iter().map(|s| (*s).to_owned()).collect();
-    let out = ctx.runner.run(&argv, Duration::from_secs(30))?;
-    if !out.success {
-        return Ok(Vec::new());
-    }
+    let out = match ctx.runner.run(&argv, Duration::from_secs(30)) {
+        Ok(out) if out.success => out,
+        Ok(out) => {
+            tracing::warn!(stderr = %out.stderr.trim(), "rustup toolchain list failed; skipping Rust toolchains");
+            return Vec::new();
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not run rustup; skipping Rust toolchains");
+            return Vec::new();
+        }
+    };
     let dir = ctx.home.join(".rustup/toolchains");
-    Ok(removable_rustup_toolchains(&out.stdout)
+    removable_rustup_toolchains(&out.stdout)
         .into_iter()
         .filter_map(|toolchain| {
             let cmd = KnownCommand::RustupUninstall { toolchain: toolchain.clone() };
@@ -102,7 +112,7 @@ fn rustup(ctx: &ScanContext<'_>) -> Result<Vec<Finding>, ScanError> {
                  projects that pin it (rust-toolchain.toml) reinstall it on their next build.",
             )
         })
-        .collect())
+        .collect()
 }
 
 // ---- Node (nvm, fnm) -----------------------------------------------------------------------
@@ -230,27 +240,87 @@ fn fnm(ctx: &ScanContext<'_>) -> Vec<Finding> {
 
 // ---- pyenv ---------------------------------------------------------------------------------
 
+/// Version names selected in a pyenv `version` file: whitespace-separated, `#` starts a
+/// comment, `system` means the OS Python.
+fn pyenv_selected(text: &str) -> Vec<String> {
+    text.lines()
+        .flat_map(|line| line.split('#').next().unwrap_or_default().split_whitespace())
+        .filter(|name| *name != "system")
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Installed versions that the selected names depend on, or `None` when a name cannot be
+/// resolved (then nothing is offered: a wrong guess would delete the Python you use).
+///
+/// - an installed version keeps itself;
+/// - a pyenv-virtualenv name (`versions/<env>` → `versions/<base>/envs/<env>`) keeps its base;
+/// - a prefix such as `3.12`, which pyenv resolves to an installed `3.12.x`, keeps every match.
+fn pyenv_keep(versions_dir: &Path, installed: &[String], selected: &[String]) -> Option<HashSet<String>> {
+    let canonical_versions = versions_dir.canonicalize().ok()?;
+    let mut keep = HashSet::new();
+    for name in selected {
+        let before = keep.len();
+        if let Ok(resolved) = versions_dir.join(name).canonicalize()
+            && let Ok(rel) = resolved.strip_prefix(&canonical_versions)
+            && let Some(base) = rel.components().next()
+        {
+            keep.insert(base.as_os_str().to_string_lossy().into_owned());
+        }
+        keep.extend(
+            installed
+                .iter()
+                .filter(|v| v.starts_with(&format!("{name}.")) || v.starts_with(&format!("{name}-")))
+                .cloned(),
+        );
+        if keep.len() == before && !keep.contains(name) {
+            tracing::warn!(version = %name, "pyenv version is not installed; not offering any pyenv version");
+            return None;
+        }
+    }
+    Some(keep)
+}
+
+/// Names of the pyenv-virtualenv environments stored inside an installed version.
+fn pyenv_envs(version: &Path) -> Vec<String> {
+    children(&version.join("envs")).iter().map(|p| file_name(p)).collect()
+}
+
 fn pyenv(ctx: &ScanContext<'_>) -> Vec<Finding> {
     let root = ctx.home.join(".pyenv");
     let versions_dir = root.join("versions");
-    let global: HashSet<String> = std::fs::read_to_string(root.join("version"))
-        .unwrap_or_default()
-        .lines()
-        .map(|l| l.trim().to_owned())
-        .filter(|l| !l.is_empty())
-        .collect();
-    version_dirs(&versions_dir)
+    let versions = version_dirs(&versions_dir);
+    if versions.is_empty() {
+        return Vec::new();
+    }
+    let installed: Vec<String> = versions.iter().map(|(n, _)| n.clone()).collect();
+    let selected = pyenv_selected(&std::fs::read_to_string(root.join("version")).unwrap_or_default());
+    let Some(keep) = pyenv_keep(&versions_dir, &installed, &selected) else {
+        return Vec::new();
+    };
+    versions
         .iter()
-        .filter(|(name, _)| !global.contains(name))
+        .filter(|(name, _)| !keep.contains(name))
         .filter_map(|(name, path)| {
+            let mut detail = "Python installed with pyenv that is not your global version. Projects may still select \
+                              it with a .python-version file; reinstall with `pyenv install`."
+                .to_owned();
+            let envs = pyenv_envs(path);
+            if !envs.is_empty() {
+                let _ = write!(
+                    detail,
+                    " It also contains {} virtualenv(s) that are deleted with it: {}.",
+                    envs.len(),
+                    envs.join(", ")
+                );
+            }
             finding(
                 ctx,
                 format!("toolchains:pyenv:{name}"),
                 format!("Python {name} (pyenv)"),
                 path,
                 CleanupAction::RemovePath { path: path.clone(), root: versions_dir.clone() },
-                "Python installed with pyenv that is not your global version. Projects may still select it with \
-                 a .python-version file; reinstall with `pyenv install`.",
+                &detail,
             )
         })
         .collect()
@@ -288,6 +358,8 @@ fn jetbrains(ctx: &ScanContext<'_>) -> Vec<Finding> {
             versions.pop(); // keep the newest version of each IDE
             versions
         })
+        // Scratch files are the user's own writing; never offer a folder that still holds some.
+        .filter(|(_, path)| children(&path.join("scratches")).is_empty())
         .filter_map(|(_, path)| {
             let name = file_name(&path);
             finding(
@@ -296,8 +368,8 @@ fn jetbrains(ctx: &ScanContext<'_>) -> Vec<Finding> {
                 format!("{name} settings"),
                 &path,
                 CleanupAction::RemovePath { path: path.clone(), root: base.clone() },
-                "Settings, plugins and local history of an older JetBrains IDE version. Newer versions import \
-                 them on upgrade.",
+                "Settings and plugins of an older JetBrains IDE version. Newer versions import them on \
+                 upgrade. Folders that still contain scratch files are never offered.",
             )
         })
         .collect()
@@ -358,6 +430,10 @@ mod tests {
             ["nightly-aarch64-apple-darwin", "1.94.0-aarch64-apple-darwin", "1.95.0-aarch64-apple-darwin"]
         );
         assert!(removable_rustup_toolchains("stable-x86_64-unknown-linux-gnu (active, default)\n").is_empty());
+        assert!(
+            removable_rustup_toolchains("1.70.0-x86_64-unknown-linux-gnu (override)\n").is_empty(),
+            "older rustup marks a directory override this way"
+        );
     }
 
     #[test]
@@ -377,6 +453,18 @@ mod tests {
         assert!(found[0].last_modified.is_some());
         let failing = FakeRunner::new().respond("rustup toolchain list", false, "");
         assert!(ToolchainsScanner.scan(&env.ctx(Os::MacOs, &failing)).expect("scan").is_empty());
+    }
+
+    #[test]
+    fn rustup_failure_does_not_hide_other_toolchains() {
+        let env = Env::new();
+        env.file(".rustup/toolchains/1.94.0-aarch64-apple-darwin/lib/librustc.dylib", BIG);
+        env.file(".pyenv/versions/3.11.9/bin/python", BIG);
+        env.file(".pyenv/versions/3.12.4/bin/python", BIG);
+        std::fs::write(env.home.join(".pyenv/version"), "3.12.4\n").expect("version");
+        let runner = FakeRunner::new().time_out("rustup toolchain list");
+        let found = ToolchainsScanner.scan(&env.ctx(Os::MacOs, &runner)).expect("scan never fails");
+        assert_eq!(titles(&found), ["Python 3.11.9 (pyenv)"]);
     }
 
     #[test]
@@ -441,6 +529,61 @@ mod tests {
         assert_eq!(titles(&found), ["Python 3.11.9 (pyenv)"]);
     }
 
+    fn pyenv_versions(env: &Env, versions: &[&str], version_file: &str) -> Vec<Finding> {
+        for v in versions {
+            env.file(&format!(".pyenv/versions/{v}/bin/python"), BIG);
+        }
+        std::fs::write(env.home.join(".pyenv/version"), version_file).expect("version");
+        let runner = FakeRunner::new();
+        ToolchainsScanner.scan(&env.ctx(Os::MacOs, &runner)).expect("scan")
+    }
+
+    #[test]
+    fn pyenv_global_virtualenv_keeps_its_base_version() {
+        let env = Env::new();
+        env.file(".pyenv/versions/3.11.9/envs/work/bin/python", BIG);
+        std::os::unix::fs::symlink(
+            env.home.join(".pyenv/versions/3.11.9/envs/work"),
+            env.home.join(".pyenv/versions/work"),
+        )
+        .expect("symlink");
+        let found = pyenv_versions(&env, &["3.11.9", "3.12.4"], "work\n");
+        assert_eq!(titles(&found), ["Python 3.12.4 (pyenv)"], "3.11.9 hosts the global virtualenv");
+    }
+
+    #[test]
+    fn pyenv_version_file_comments_and_prefixes() {
+        let env = Env::new();
+        let found = pyenv_versions(&env, &["3.11.9", "3.12.4"], "3.12.4 # main interpreter\n");
+        assert_eq!(titles(&found), ["Python 3.11.9 (pyenv)"]);
+        let env = Env::new();
+        let found = pyenv_versions(&env, &["3.11.9", "3.12.1", "3.12.4"], "3.12\n");
+        assert_eq!(titles(&found), ["Python 3.11.9 (pyenv)"], "every 3.12.x is kept for prefix 3.12");
+        let env = Env::new();
+        let found = pyenv_versions(&env, &["3.11.9", "3.12.4"], "system\n# only comments\n");
+        assert_eq!(titles(&found).len(), 2, "system Python selects no pyenv version");
+    }
+
+    #[test]
+    fn pyenv_offers_nothing_when_global_cannot_be_resolved() {
+        let env = Env::new();
+        let found = pyenv_versions(&env, &["3.11.9", "3.12.4"], "3.10.2\n");
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn pyenv_warns_about_virtualenvs_inside_a_version() {
+        let env = Env::new();
+        env.file(".pyenv/versions/3.11.9/envs/old-project/bin/python", BIG);
+        let found = pyenv_versions(&env, &["3.11.9", "3.12.4"], "3.12.4\n");
+        assert_eq!(titles(&found), ["Python 3.11.9 (pyenv)"]);
+        assert!(
+            found[0].detail.contains("1 virtualenv(s) that are deleted with it: old-project"),
+            "{}",
+            found[0].detail
+        );
+    }
+
     #[test]
     fn jetbrains_keeps_newest_per_product() {
         assert_eq!(jetbrains_version("IntelliJIdea2024.3"), Some(("IntelliJIdea".into(), vec![2024, 3])));
@@ -455,6 +598,20 @@ mod tests {
         let runner = FakeRunner::new();
         let found = ToolchainsScanner.scan(&env.ctx(Os::MacOs, &runner)).expect("scan");
         assert_eq!(titles(&found), ["GoLand2023.1 settings", "GoLand2024.3 settings"]);
+    }
+
+    #[test]
+    fn jetbrains_folders_with_scratch_files_are_never_offered() {
+        let env = Env::new();
+        for d in ["GoLand2023.1", "GoLand2024.3", "GoLand2025.2"] {
+            env.file(&format!("Library/Application Support/JetBrains/{d}/options/x.xml"), BIG);
+        }
+        env.file("Library/Application Support/JetBrains/GoLand2023.1/scratches/notes.sql", 100);
+        std::fs::create_dir_all(env.home.join("Library/Application Support/JetBrains/GoLand2024.3/scratches"))
+            .expect("empty scratches dir");
+        let runner = FakeRunner::new();
+        let found = ToolchainsScanner.scan(&env.ctx(Os::MacOs, &runner)).expect("scan");
+        assert_eq!(titles(&found), ["GoLand2024.3 settings"], "an empty scratches folder does not block");
     }
 
     #[test]

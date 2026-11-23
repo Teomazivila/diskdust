@@ -16,7 +16,7 @@ use egui::{Align, Color32, Layout, RichText, Sense, vec2};
 use egui_extras::{Column, TableBuilder};
 
 use crate::format;
-use crate::settings::{Settings, SettingsStore};
+use crate::settings::{Loaded, Settings, SettingsStore};
 use crate::worker::{self, CleanResult, Msg, Notifier};
 
 const SAFE: Color32 = Color32::from_rgb(102, 187, 106);
@@ -124,7 +124,7 @@ impl DiskdustApp {
     pub fn new(cc: &eframe::CreationContext<'_>, os: Os, home: PathBuf, store: SettingsStore) -> Self {
         configure_style(&cc.egui_ctx);
         let (tx, rx) = channel();
-        let saved = store.load();
+        let Loaded { settings: saved, problem: settings_problem } = store.load();
         let roots_customized = saved.project_roots.is_some();
         let project_roots = saved.project_roots.clone().map_or_else(|| default_project_roots(&home), unique_dirs);
         Self {
@@ -159,6 +159,20 @@ impl DiskdustApp {
         }
         .with_disk_space()
         .with_access_probe()
+        .with_settings_problem(settings_problem)
+    }
+
+    /// Keeps an unreadable settings file safe before anything is saved over it, and says so.
+    fn with_settings_problem(mut self, problem: Option<String>) -> Self {
+        let Some(problem) = problem else { return self };
+        let backup = match self.store.back_up() {
+            Ok(Some(path)) => format!(" A copy was saved to {}.", path.display()),
+            Ok(None) => String::new(),
+            Err(e) => format!(" Could not back it up: {e}."),
+        };
+        self.status = format!("Some settings could not be read and were reset.{backup}");
+        self.log(false, format!("{problem}.{backup}"));
+        self
     }
 
     fn with_access_probe(mut self) -> Self {
@@ -482,9 +496,17 @@ impl DiskdustApp {
         );
     }
 
+    /// What a clean would remove right now: selected, actionable and not ignored. The toolbar
+    /// button, the confirmation dialog and the clean itself all use this one definition.
+    fn clean_set(&self) -> Vec<&Finding> {
+        self.findings
+            .iter()
+            .filter(|f| self.selected.contains(&f.id) && f.is_actionable() && !self.is_ignored(f))
+            .collect()
+    }
+
     fn start_clean(&mut self) {
-        let items: Vec<Finding> =
-            self.findings.iter().filter(|f| self.selected.contains(&f.id) && f.is_actionable()).cloned().collect();
+        let items: Vec<Finding> = self.clean_set().into_iter().cloned().collect();
         if items.is_empty() {
             return;
         }
@@ -605,10 +627,7 @@ impl DiskdustApp {
     }
 
     fn selection_summary(&self) -> (usize, u64) {
-        self.findings
-            .iter()
-            .filter(|f| self.selected.contains(&f.id))
-            .fold((0, 0), |(n, b), f| (n + 1, b + f.bytes_or_zero()))
+        self.clean_set().iter().fold((0, 0), |(n, b), f| (n + 1, b + f.bytes_or_zero()))
     }
 
     // ---- Panels ------------------------------------------------------------------------------
@@ -900,7 +919,7 @@ impl DiskdustApp {
     fn table_row(&self, mut row: egui_extras::TableRow<'_, '_>, f: &Finding, rc: RowContext, out: &mut Vec<RowAction>) {
         row.col(|ui| {
             let mut checked = self.selected.contains(&f.id);
-            let enabled = f.is_actionable() && !rc.busy;
+            let enabled = f.is_actionable() && !rc.busy && !self.is_ignored(f);
             let response = ui.add_enabled(enabled, egui::Checkbox::without_text(&mut checked));
             let label = format!("Select {}", f.title);
             response.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, checked, &label));
@@ -961,8 +980,9 @@ impl DiskdustApp {
     }
 
     fn confirm_modal(&mut self, ctx: &egui::Context) {
-        let chosen: Vec<&Finding> =
-            self.findings.iter().filter(|f| self.selected.contains(&f.id) && !self.is_ignored(f)).collect();
+        let chosen = self.clean_set();
+        let visible: HashSet<&str> = self.visible().into_iter().map(|i| self.findings[i].id.as_str()).collect();
+        let hidden = chosen.iter().filter(|f| !visible.contains(f.id.as_str())).count();
         let total: u64 = chosen.iter().map(|f| f.bytes_or_zero()).sum();
         let review = chosen.iter().filter(|f| f.risk == Risk::Review).count();
         let admin = chosen.iter().filter(|f| f.privilege == Privilege::Admin).count();
@@ -984,6 +1004,17 @@ impl DiskdustApp {
                 let _ = write!(size, " (plus {} of unknown size)", format::items(unknown));
             }
             ui.label(size);
+            ui.add_space(6.0);
+            chosen_list(ui, &chosen);
+            if hidden > 0 {
+                ui.label(
+                    RichText::new(format!(
+                        "{ICON_WARN} {} not shown by the current filter.",
+                        if hidden == 1 { "1 of these is".to_owned() } else { format!("{hidden} of these are") }
+                    ))
+                    .color(REVIEW),
+                );
+            }
             ui.add_space(6.0);
             match self.mode {
                 DeleteMode::Trash => {
@@ -1131,6 +1162,20 @@ fn privacy_prompt_note(os: Os, home: &std::path::Path, roots: &[PathBuf]) -> Opt
         );
     }
     Some(note)
+}
+
+/// Every item a clean will touch, so nothing selected under another filter goes unnoticed.
+fn chosen_list(ui: &mut egui::Ui, chosen: &[&Finding]) {
+    egui::ScrollArea::vertical().max_height(150.0).id_salt("chosen-items").show(ui, |ui| {
+        egui::Grid::new("chosen-items-grid").num_columns(3).spacing(vec2(12.0, 4.0)).show(ui, |ui| {
+            for f in chosen {
+                ui.label(RichText::new(format::maybe_bytes(f.bytes)).weak());
+                ui.label(&f.title);
+                ui.label(RichText::new(f.category.label()).weak());
+                ui.end_row();
+            }
+        });
+    });
 }
 
 fn clean_summary(t: &CleanTally) -> String {
@@ -1430,7 +1475,7 @@ mod tests {
         use super::super::*;
         use diskdust_core::model::{CleanupAction, KnownCommand, SPECIFIC};
         use egui_kittest::Harness;
-        use egui_kittest::kittest::Queryable;
+        use egui_kittest::kittest::{NodeT as _, Queryable};
         use std::path::Path;
         use std::time::Duration;
 
@@ -1558,6 +1603,42 @@ mod tests {
         }
 
         #[test]
+        fn ignored_items_are_never_cleaned_even_if_selected() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let mut harness = harness(home.path());
+            harness.state_mut().findings = sample();
+            harness.state_mut().phase = Phase::Idle;
+            harness.state_mut().ignored = ["gobuild".to_owned()].into();
+            harness.state_mut().show_ignored = true;
+            // A selection that still contains an ignored id (e.g. ignored after it was ticked).
+            harness.state_mut().selected = ["gobuild".to_owned(), "brew".to_owned()].into();
+            harness.run();
+            let set: Vec<String> = harness.state().clean_set().iter().map(|f| f.id.clone()).collect();
+            assert_eq!(set, ["brew"]);
+            harness.get_by_label("Clean 1 · 1.8 GB").click();
+            harness.run();
+            harness.get_by_label("Clean 1 item?");
+            let checkbox = harness.get_by_label("Select Go build cache");
+            assert!(checkbox.accesskit_node().is_disabled(), "ignored rows cannot be ticked");
+        }
+
+        #[test]
+        fn confirm_lists_items_hidden_by_the_filter() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let mut harness = harness(home.path());
+            harness.state_mut().findings = sample();
+            harness.state_mut().phase = Phase::Idle;
+            harness.state_mut().selected = ["images".to_owned(), "brew".to_owned()].into();
+            harness.state_mut().category = Some(Category::DeveloperCaches);
+            harness.run();
+            harness.get_by_label("Clean 2 · 34.1 GB").click();
+            harness.run();
+            harness.get_by_label("Clean 2 items?");
+            harness.get_by_label("Unused Docker images");
+            harness.get_by_label_contains("1 of these is not shown by the current filter");
+        }
+
+        #[test]
         fn age_filter_hides_recent_and_undated_items() {
             let home = tempfile::tempdir().expect("tempdir");
             let mut harness = harness(home.path());
@@ -1628,9 +1709,33 @@ mod tests {
             assert!(state.ignored.contains("x"));
             harness.get_by_label("Move to Trash").click();
             harness.run();
-            let saved = SettingsStore::at(path).load();
+            let saved = SettingsStore::at(path).load().settings;
             assert_eq!(saved.mode, Some(DeleteMode::Trash));
             assert_eq!(saved.older_than, Some(90));
+        }
+
+        #[test]
+        fn unreadable_settings_are_backed_up_before_being_overwritten() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let path = home.path().join("config/settings.json");
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            let original = br#"{"ignored": "not-a-list", "older_than": 30}"#;
+            std::fs::write(&path, original).expect("write");
+            let store = SettingsStore::at(path.clone());
+            let home_path = home.path().to_path_buf();
+            let mut harness = Harness::builder()
+                .with_size(vec2(1200.0, 760.0))
+                .build_eframe(move |cc| DiskdustApp::new(cc, Os::current().expect("os"), home_path, store));
+            harness.run();
+            assert_eq!(harness.state().older_than, Some(30), "readable fields are kept");
+            assert!(harness.state().status.starts_with("Some settings could not be read"));
+            harness.get_by_label("Delete permanently").click();
+            harness.run();
+            let backup = path.with_extension("json.bad");
+            assert_eq!(std::fs::read(&backup).expect("backup kept"), original);
+            let saved = SettingsStore::at(path).load();
+            assert_eq!(saved.problem, None, "the new file is valid");
+            assert_eq!(saved.settings.older_than, Some(30));
         }
 
         #[test]

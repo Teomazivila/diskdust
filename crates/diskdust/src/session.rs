@@ -7,7 +7,8 @@ use std::time::Duration;
 use diskdust_core::audit::{AuditEntry, AuditLog};
 use diskdust_core::clean::{Cleaner, DeleteMode, SystemTrash, quit_first_reason};
 use diskdust_core::command::{CommandRunner, SystemRunner};
-use diskdust_core::model::{CleanupAction, Finding, Os, Privilege};
+use diskdust_core::model::{CleanupAction, Finding, KnownCommand, Os, Privilege};
+use diskdust_core::mounts::MountTable;
 use diskdust_core::privilege::{
     HelperResult, describe_elevation_failure, elevation_argv, encode_payload, helper_executable, parse_helper_output,
 };
@@ -45,8 +46,22 @@ pub fn default_audit_log(os: Os, home: &Path) -> AuditLog {
     AuditLog::default_location(home, os, std::env::var_os("XDG_STATE_HOME").map(PathBuf::from))
 }
 
-/// Cleans every actionable finding, calling `on_result` once per item, in order: user items
-/// first, then admin items.
+/// Whether cleaning `finding` permanently empties the user's Trash.
+fn empties_trash(finding: &Finding) -> bool {
+    matches!(finding.action, Some(CleanupAction::EmptyDir { .. } | CleanupAction::Run(KnownCommand::FinderEmptyTrash)))
+}
+
+/// User-level findings in execution order. Emptying the Trash always runs **first**: otherwise
+/// items moved to the Trash earlier in the same run would be erased with it, silently turning a
+/// recoverable "Move to Trash" into a permanent delete.
+fn user_order<'a>(findings: &[&'a Finding]) -> Vec<&'a Finding> {
+    let (mut first, rest): (Vec<&Finding>, Vec<&Finding>) = findings.iter().partition(|f| empties_trash(f));
+    first.extend(rest);
+    first
+}
+
+/// Cleans every actionable finding, calling `on_result` once per item, in order: Trash-emptying
+/// items first, then the other user items, then admin items.
 pub fn clean_findings(
     os: Os,
     home: &Path,
@@ -58,7 +73,9 @@ pub fn clean_findings(
 ) {
     let runner = SystemRunner::new(home);
     let policy = SafetyPolicy::for_home(home);
-    let cleaner = Cleaner { policy: &policy, runner: &runner, trasher: &SystemTrash, mode, allow_admin: false };
+    let mounts = MountTable::current(os, &runner);
+    let cleaner =
+        Cleaner { policy: &policy, runner: &runner, trasher: &SystemTrash, mode, allow_admin: false, mounts: &mounts };
     let run_id = AuditEntry::new_run_id();
     tracing::info!(run_id = %run_id, items = findings.len(), ?mode, "clean started");
     let mut report = |finding: &Finding, action: &CleanupAction, ok: bool, message: String, elevated: bool| {
@@ -87,7 +104,7 @@ pub fn clean_findings(
     let (admin, user): (Vec<&Finding>, Vec<&Finding>) =
         findings.iter().filter(|f| f.action.is_some()).partition(|f| f.privilege == Privilege::Admin);
 
-    for finding in user {
+    for finding in user_order(&user) {
         let Some(action) = &finding.action else { continue };
         if let Some(reason) = quit_first_reason(&runner, finding) {
             report(finding, action, false, reason, false);
@@ -146,7 +163,7 @@ fn run_elevated(os: Os, runner: &dyn CommandRunner, actions: &[CleanupAction]) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use diskdust_core::model::{Category, KnownCommand, Risk, SPECIFIC};
+    use diskdust_core::model::{Category, Risk, SPECIFIC};
 
     fn finding(bytes: Option<u64>) -> Finding {
         Finding {
@@ -209,5 +226,53 @@ mod tests {
         assert!(!target.exists());
         let log = std::fs::read_to_string(audit.path()).expect("audit");
         assert_eq!(log.lines().count(), 2);
+    }
+
+    #[test]
+    fn trash_is_emptied_before_anything_is_moved_into_it() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let home = home.path().canonicalize().expect("canonical");
+        let trash = home.join("Trash");
+        std::fs::create_dir_all(&trash).expect("mkdir");
+        std::fs::write(trash.join("old"), b"x").expect("write");
+        let cache = home.join("cache");
+        let big = cache.join("big");
+        std::fs::create_dir_all(&big).expect("mkdir");
+        std::fs::write(big.join("blob"), vec![0u8; 8192]).expect("write");
+
+        // Largest first, as the scan orders them: the cache comes before the Trash.
+        let mut cache_item = finding(Some(8192));
+        cache_item.id = "big".into();
+        cache_item.action = Some(CleanupAction::RemovePath { path: big.clone(), root: cache });
+        let mut trash_item = finding(Some(1));
+        trash_item.id = "trash:user".into();
+        trash_item.category = Category::Trash;
+        trash_item.action = Some(CleanupAction::EmptyDir { path: trash.clone(), root: home.clone() });
+
+        let audit = AuditLog::new(home.join("audit.jsonl"));
+        let mut order = Vec::new();
+        clean_findings(
+            Os::current().expect("os"),
+            &home,
+            &[cache_item, trash_item],
+            DeleteMode::Permanent,
+            &audit,
+            Elevation::Skip,
+            &mut |r| order.push((r.id, r.ok)),
+        );
+        assert_eq!(order, [("trash:user".to_owned(), true), ("big".to_owned(), true)]);
+        assert!(trash.is_dir() && std::fs::read_dir(&trash).expect("read").next().is_none());
+    }
+
+    #[test]
+    fn finder_empty_trash_also_runs_first() {
+        let mut other = finding(Some(9));
+        other.id = "a".into();
+        other.action = Some(CleanupAction::Run(KnownCommand::BrewCleanup));
+        let mut finder = finding(None);
+        finder.id = "trash".into();
+        finder.action = Some(CleanupAction::Run(KnownCommand::FinderEmptyTrash));
+        let ordered: Vec<_> = user_order(&[&other, &finder]).iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ordered, ["trash", "a"]);
     }
 }

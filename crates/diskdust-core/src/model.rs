@@ -200,6 +200,7 @@ fn is_toolchain_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 100
         && !name.starts_with('-')
+        && !name.bytes().all(|b| b == b'.')
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
 }
 
@@ -336,7 +337,7 @@ mod tests {
         let ok = KnownCommand::RustupUninstall { toolchain: "1.94.0-aarch64-apple-darwin".into() };
         assert_eq!(ok.argv(), ["rustup", "toolchain", "uninstall", "1.94.0-aarch64-apple-darwin"]);
         assert!(ok.is_well_formed() && !ok.requires_admin());
-        for bad in ["", "--all", "stable; rm -rf ~", "a b", "../x"] {
+        for bad in ["", "--all", "stable; rm -rf ~", "a b", "../x", ".", ".."] {
             assert!(!KnownCommand::RustupUninstall { toolchain: bad.into() }.is_well_formed(), "{bad:?}");
         }
     }

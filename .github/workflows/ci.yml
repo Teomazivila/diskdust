@@ -4,13 +4,18 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly run: new RustSec advisories and runner-image changes surface even without commits.
+  schedule:
+    - cron: "17 6 * * 1"
 
 permissions:
   contents: read
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseded PR pushes are cancelled; runs on main always finish, otherwise a quick second push
+  # would leave the first commit without a CI result and it could never be released.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
