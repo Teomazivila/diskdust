@@ -41,16 +41,18 @@ pub enum Category {
     Toolchains,
     Installers,
     LargeFiles,
+    Custom,
 }
 
 impl Category {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Containers,
         Self::DeveloperCaches,
         Self::Toolchains,
         Self::BuildArtifacts,
         Self::Installers,
         Self::LargeFiles,
+        Self::Custom,
         Self::AppCaches,
         Self::Logs,
         Self::Xcode,
@@ -75,6 +77,7 @@ impl Category {
             Self::Toolchains => "Old toolchains",
             Self::Installers => "Installers",
             Self::LargeFiles => "Large files",
+            Self::Custom => "Your rules",
         }
     }
 }

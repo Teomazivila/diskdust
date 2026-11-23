@@ -12,7 +12,7 @@ use diskdust_core::command::SystemRunner;
 use diskdust_core::disk;
 use diskdust_core::model::{Finding, Os};
 use diskdust_core::scan::{ScanEvent, run_scan};
-use diskdust_core::scanners::{ScanContext, Scanner, TrashScanner, default_app_dirs, scanners_for};
+use diskdust_core::scanners::{ScanContext, ScanOptions, Scanner, TrashScanner, default_app_dirs, scanners_for};
 
 pub use crate::session::CleanResult;
 use crate::session::{Elevation, clean_findings, default_audit_log};
@@ -66,7 +66,7 @@ pub fn spawn_scan(
     os: Os,
     home: PathBuf,
     project_roots: Vec<PathBuf>,
-    large_files: bool,
+    options: ScanOptions,
     cancel: Arc<AtomicBool>,
     notifier: Notifier,
 ) {
@@ -83,7 +83,7 @@ pub fn spawn_scan(
             cancel: &cancel,
         };
         let emit = |event| notifier.send(Msg::Scan(event));
-        let findings = run_scan(&ctx, &scanners_for(large_files), &emit);
+        let findings = run_scan(&ctx, &scanners_for(&options), &emit);
         let cancelled = ctx.is_cancelled();
         notifier.send(Msg::ScanDone { findings, elapsed: started.elapsed(), cancelled });
     });

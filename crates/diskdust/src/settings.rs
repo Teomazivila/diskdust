@@ -9,6 +9,7 @@ use std::io;
 use std::path::PathBuf;
 
 use diskdust_core::clean::DeleteMode;
+use diskdust_core::scanners::CustomRule;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +24,8 @@ pub struct Settings {
     /// Also search the home folder for large files (opt-in: it reads personal folders, which
     /// makes macOS ask for access to each of them).
     pub large_files: bool,
+    /// Extra folders to report, confined to the home folder (see `CustomRule`).
+    pub custom_rules: Vec<CustomRule>,
 }
 
 /// Result of [`SettingsStore::load`].
@@ -97,6 +100,7 @@ impl SettingsStore {
             older_than: field(&map, "older_than", &mut bad),
             ignored: field(&map, "ignored", &mut bad).unwrap_or_default(),
             large_files: field(&map, "large_files", &mut bad).unwrap_or_default(),
+            custom_rules: field(&map, "custom_rules", &mut bad).unwrap_or_default(),
         };
         let problem = (!bad.is_empty()).then(|| format!("{}: could not read {}", path.display(), bad.join(", ")));
         Loaded { settings, problem }
@@ -142,6 +146,7 @@ mod tests {
             older_than: Some(30),
             ignored: ["docker:Images".to_owned()].into(),
             large_files: true,
+            custom_rules: vec![serde_json::from_str(r#"{"path":"~/renders","mode":"children"}"#).expect("rule")],
         };
         store.save(&settings).expect("save");
         assert_eq!(store.load(), Loaded { settings, problem: None });

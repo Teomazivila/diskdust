@@ -71,8 +71,31 @@ was last modified.
   skipped while the app runs; the confirmation dialog says which apps to quit.
 - **Free space** of your home volume in the toolbar, **Empty Trash** after a Trash-mode clean, and a
   **History** of past cleanups (from the audit log).
+- **Your own rules**: add folders no built-in rule knows to `settings.json` (see below).
 - Project folders, delete mode, age filter and ignored items are saved in `settings.json`
   (`~/Library/Application Support/diskdust/` on macOS, `$XDG_CONFIG_HOME/diskdust/` on Linux).
+
+### Your own rules
+
+Add `custom_rules` to `settings.json` to report folders that are specific to you:
+
+```json
+{
+  "custom_rules": [
+    { "path": "~/Projects/old-renders", "mode": "children", "title": "Old renders" },
+    { "path": "~/Library/Caches/SomeApp", "risk": "safe" }
+  ]
+}
+```
+
+- `path`: `~/…` or an absolute path **inside your home folder** (system paths are refused).
+- `mode`: `whole` (default, one item) or `children` (one item per entry inside the folder).
+- `risk`: `review` (default) or `safe` (then *Select safe* picks it).
+- `title`: optional label.
+
+Results appear under **Your rules** and follow every safety rule above. A rule naming a protected
+folder (`~/Documents` itself, `~/.ssh`, …) or a path outside your home is skipped and shown as
+*Rule skipped* with the reason. The app keeps your rules when it saves other settings.
 
 ## Safety model
 
@@ -105,7 +128,7 @@ diskdust clean [filters] --yes [--include-review] [--permanent] [--json]
 ```
 
 Filters: `--category <name>` (repeatable: `containers`, `developer-caches`, `old-toolchains`,
-`build-artifacts`, `installers`, `large-files`, `app-caches`, `logs`, `xcode`, `device-backups`,
+`build-artifacts`, `installers`, `large-files`, `your-rules`, `app-caches`, `logs`, `xcode`, `device-backups`,
 `orphaned-app-data`, `trash`, `system`), `--safe-only`, `--older-than <days>`; `--large-files`
 also searches your home folder for large files.
 

@@ -11,7 +11,9 @@ use diskdust_core::command::SystemRunner;
 use diskdust_core::disk;
 use diskdust_core::model::{Category, Finding, Os, Privilege, Risk};
 use diskdust_core::scan::{ScanEvent, run_scan};
-use diskdust_core::scanners::{ScanContext, default_app_dirs, default_project_roots, scanners_for, unique_dirs};
+use diskdust_core::scanners::{
+    ScanContext, ScanOptions, default_app_dirs, default_project_roots, scanners_for, unique_dirs,
+};
 
 use crate::format;
 use crate::session::{CleanResult, Elevation, clean_findings, default_audit_log};
@@ -187,7 +189,9 @@ fn scan_machine(settings: &Settings, large_files: bool) -> anyhow::Result<(Os, P
             eprintln!("warning: {name}: {error}");
         }
     };
-    let findings = run_scan(&ctx, &scanners_for(large_files || settings.large_files), &emit);
+    let options =
+        ScanOptions { large_files: large_files || settings.large_files, custom_rules: settings.custom_rules.clone() };
+    let findings = run_scan(&ctx, &scanners_for(&options), &emit);
     let findings = findings.into_iter().filter(|f| !settings.ignored.contains(&f.id)).collect();
     Ok((os, home, findings))
 }

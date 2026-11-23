@@ -11,7 +11,7 @@ use std::time::Instant;
 use diskdust_core::clean::DeleteMode;
 use diskdust_core::model::{Category, CleanupAction, Finding, Os, Privilege, Risk};
 use diskdust_core::scan::ScanEvent;
-use diskdust_core::scanners::{LARGE_FILE_MIN, default_project_roots, unique_dirs};
+use diskdust_core::scanners::{CustomRule, LARGE_FILE_MIN, ScanOptions, default_project_roots, unique_dirs};
 use egui::{Align, Color32, Layout, RichText, Sense, vec2};
 use egui_extras::{Column, TableBuilder};
 
@@ -89,6 +89,8 @@ struct SearchScope {
     customized: bool,
     /// Opt-in search for large files in the home folder.
     large_files: bool,
+    /// Rules from settings.json; not edited in the app but always written back unchanged.
+    custom_rules: Vec<CustomRule>,
 }
 
 #[derive(Debug)]
@@ -150,7 +152,12 @@ impl DiskdustApp {
             older_than: saved.older_than,
             ignored: saved.ignored.clone(),
             show_ignored: false,
-            scope: SearchScope { project_roots, customized: roots_customized, large_files: saved.large_files },
+            scope: SearchScope {
+                project_roots,
+                customized: roots_customized,
+                large_files: saved.large_files,
+                custom_rules: saved.custom_rules.clone(),
+            },
             store,
             mode: saved.mode.unwrap_or(DeleteMode::Trash),
             phase: Phase::Welcome,
@@ -326,6 +333,7 @@ impl DiskdustApp {
             older_than: self.older_than,
             ignored: self.ignored.clone(),
             large_files: self.scope.large_files,
+            custom_rules: self.scope.custom_rules.clone(),
         }
     }
 
@@ -336,7 +344,8 @@ impl DiskdustApp {
             && current.mode.unwrap_or(DeleteMode::Trash) == self.saved.mode.unwrap_or(DeleteMode::Trash)
             && current.older_than == self.saved.older_than
             && current.ignored == self.saved.ignored
-            && current.large_files == self.saved.large_files;
+            && current.large_files == self.saved.large_files
+            && current.custom_rules == self.saved.custom_rules;
         if unchanged {
             return;
         }
@@ -505,7 +514,7 @@ impl DiskdustApp {
             self.os,
             self.home.clone(),
             self.scope.project_roots.clone(),
-            self.scope.large_files,
+            ScanOptions { large_files: self.scope.large_files, custom_rules: self.scope.custom_rules.clone() },
             Arc::clone(&self.cancel),
             self.notifier.clone(),
         );
@@ -1731,6 +1740,9 @@ mod tests {
                     older_than: Some(90),
                     ignored: ["x".to_owned()].into(),
                     large_files: true,
+                    custom_rules: vec![
+                        serde_json::from_str(r#"{"path":"~/renders","mode":"children"}"#).expect("rule"),
+                    ],
                 })
                 .expect("seed");
             let home_path = home.path().to_path_buf();
@@ -1748,6 +1760,8 @@ mod tests {
             let saved = SettingsStore::at(path).load().settings;
             assert_eq!(saved.mode, Some(DeleteMode::Trash));
             assert_eq!(saved.older_than, Some(90));
+            assert_eq!(saved.custom_rules.len(), 1, "custom rules survive the app saving other settings");
+            assert_eq!(saved.custom_rules[0].path, "~/renders");
         }
 
         #[test]
