@@ -76,6 +76,8 @@ struct CleanTally {
     trashed: u64,
     ok: usize,
     failed: usize,
+    /// Measured change in free space of the home volume over the clean.
+    disk_gain: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -544,7 +546,8 @@ impl DiskdustApp {
                         self.breakdown = Breakdown::Ready(id, entries);
                     }
                 }
-                Msg::CleanDone => {
+                Msg::CleanDone { disk_gain } => {
+                    self.tally.disk_gain = disk_gain;
                     self.status = clean_summary(&self.tally);
                     self.phase = Phase::Idle;
                     self.offer_empty_trash = self.tally.trashed > 0;
@@ -1186,6 +1189,9 @@ fn clean_summary(t: &CleanTally) -> String {
     if t.failed > 0 {
         let _ = write!(status, " · {} failed (see Activity)", t.failed);
     }
+    if let Some(gain) = t.disk_gain {
+        let _ = write!(status, " · free space {} (measured)", format::signed_bytes(gain));
+    }
     status
 }
 
@@ -1388,9 +1394,11 @@ mod tests {
 
     #[test]
     fn clean_summary_mentions_trash_and_failures() {
-        let t = CleanTally { freed: 2_000_000_000, trashed: 0, ok: 3, failed: 0 };
+        let t = CleanTally { freed: 2_000_000_000, trashed: 0, ok: 3, failed: 0, disk_gain: None };
         assert_eq!(clean_summary(&t), "Cleaned 3 items, freed 2.0 GB");
-        let t = CleanTally { freed: 0, trashed: 5_000_000, ok: 1, failed: 2 };
+        let t = CleanTally { disk_gain: Some(2_100_000_000), ..t };
+        assert_eq!(clean_summary(&t), "Cleaned 3 items, freed 2.0 GB · free space +2.1 GB (measured)");
+        let t = CleanTally { freed: 0, trashed: 5_000_000, ok: 1, failed: 2, disk_gain: None };
         assert_eq!(
             clean_summary(&t),
             "Cleaned 1 item, freed 0 B · 5.0 MB moved to Trash (empty the Trash to reclaim it) · 2 failed (see Activity)"
@@ -1966,7 +1974,9 @@ mod tests {
             harness.run();
             harness.get_by_label("Delete 3 items permanently").click();
             wait_until_idle(&mut harness);
-            assert_eq!(harness.state().status, "Cleaned 3 items, freed 3.0 kB");
+            let status = &harness.state().status;
+            assert!(status.starts_with("Cleaned 3 items, freed 3.0 kB"), "{status}");
+            assert!(status.contains("(measured)"), "free-space change is measured: {status}");
             assert_eq!(std::fs::read_dir(&root).expect("read").count(), 0);
         }
 
@@ -1995,7 +2005,9 @@ mod tests {
             assert!(!target.exists(), "selected item must be removed");
             assert!(home_path.join("cache").exists(), "its parent must remain");
             assert!(harness.state().findings.is_empty());
-            assert_eq!(harness.state().status, "Cleaned 1 item, freed 4.1 kB");
+            let status = &harness.state().status;
+            assert!(status.starts_with("Cleaned 1 item, freed 4.1 kB"), "{status}");
+            assert!(status.contains("(measured)"), "free-space change is measured: {status}");
             // Same resolution as the worker, so the test also passes when XDG_STATE_HOME is set.
             let log = diskdust_core::audit::AuditLog::default_location(
                 &home_path,

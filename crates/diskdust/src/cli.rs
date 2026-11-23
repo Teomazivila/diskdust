@@ -8,6 +8,7 @@ use std::sync::atomic::AtomicBool;
 use anyhow::{Context as _, bail};
 use diskdust_core::clean::DeleteMode;
 use diskdust_core::command::SystemRunner;
+use diskdust_core::disk;
 use diskdust_core::model::{Category, Finding, Os, Privilege, Risk};
 use diskdust_core::scan::{ScanEvent, run_scan};
 use diskdust_core::scanners::{ScanContext, default_app_dirs, default_project_roots, default_scanners, unique_dirs};
@@ -228,6 +229,7 @@ pub fn clean(args: &[String]) -> anyhow::Result<()> {
     }
     let audit = default_audit_log(os, &home);
     let mut results = Vec::new();
+    let before = disk::space(&home);
     clean_findings(os, &home, &chosen, opts.mode, &audit, Elevation::Skip, &mut |r| {
         if !opts.json {
             println!("{} {} — {}", if r.ok { "ok  " } else { "FAIL" }, r.title, r.message);
@@ -237,7 +239,7 @@ pub fn clean(args: &[String]) -> anyhow::Result<()> {
     if opts.json {
         println!("{}", serde_json::to_string_pretty(&results)?);
     } else {
-        println!("\n{}", summary(&results));
+        println!("\n{}", summary(&results, disk::gained(before, disk::space(&home))));
     }
     let failed = results.iter().filter(|r| !r.ok).count();
     if failed > 0 {
@@ -269,7 +271,7 @@ fn held_back_note(held: &[(Finding, HeldBack)]) -> String {
     format!("not included: {}", parts.join("; "))
 }
 
-fn summary(results: &[CleanResult]) -> String {
+fn summary(results: &[CleanResult], disk_gain: Option<i64>) -> String {
     let ok: Vec<&CleanResult> = results.iter().filter(|r| r.ok).collect();
     let freed: u64 = ok.iter().filter(|r| !r.trashed).filter_map(|r| r.bytes).sum();
     let trashed: u64 = ok.iter().filter(|r| r.trashed).filter_map(|r| r.bytes).sum();
@@ -280,6 +282,9 @@ fn summary(results: &[CleanResult]) -> String {
     let failed = results.len() - ok.len();
     if failed > 0 {
         let _ = write!(out, ", {failed} not cleaned");
+    }
+    if let Some(gain) = disk_gain {
+        let _ = write!(out, "; free space {} (measured)", format::signed_bytes(gain));
     }
     out
 }
@@ -405,8 +410,12 @@ mod tests {
             trashed,
         };
         assert_eq!(
-            summary(&[r(true, 2_000_000, false), r(true, 3_000_000, true), r(false, 1, false)]),
+            summary(&[r(true, 2_000_000, false), r(true, 3_000_000, true), r(false, 1, false)], None),
             "cleaned 2 items, freed 2.0 MB, 3.0 MB moved to the Trash (empty it to reclaim), 1 not cleaned"
+        );
+        assert_eq!(
+            summary(&[r(true, 2_000_000, false)], Some(1_900_000)),
+            "cleaned 1 item, freed 2.0 MB; free space +1.9 MB (measured)"
         );
         assert!(USAGE.contains("--dry-run"));
     }

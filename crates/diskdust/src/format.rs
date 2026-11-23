@@ -21,6 +21,15 @@ pub fn reclaimable(known: u64, has_unknown: bool) -> String {
     }
 }
 
+/// Signed size for measured changes: "+1.2 GB", "−300 MB", "0 B".
+pub fn signed_bytes(n: i64) -> String {
+    match n.signum() {
+        1 => format!("+{}", bytes(n.unsigned_abs())),
+        -1 => format!("−{}", bytes(n.unsigned_abs())),
+        _ => "0 B".to_owned(),
+    }
+}
+
 /// "1 item", "3 items".
 pub fn items(n: usize) -> String {
     if n == 1 { "1 item".to_owned() } else { format!("{n} items") }
@@ -76,6 +85,14 @@ mod tests {
         assert_eq!(reclaimable(0, true), "size unknown");
         assert_eq!(reclaimable(2_000, true), "2.0 kB+");
         assert_eq!(reclaimable(0, false), "0 B");
+    }
+
+    #[test]
+    fn signed_sizes() {
+        assert_eq!(signed_bytes(1_200_000_000), "+1.2 GB");
+        assert_eq!(signed_bytes(-300_000_000), "−300 MB");
+        assert_eq!(signed_bytes(0), "0 B");
+        assert_eq!(signed_bytes(i64::MIN), "−9223 PB");
     }
 
     #[test]

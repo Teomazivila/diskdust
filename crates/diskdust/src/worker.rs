@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use diskdust_core::clean::DeleteMode;
 use diskdust_core::command::SystemRunner;
+use diskdust_core::disk;
 use diskdust_core::model::{Finding, Os};
 use diskdust_core::scan::{ScanEvent, run_scan};
 use diskdust_core::scanners::{ScanContext, Scanner, TrashScanner, default_app_dirs, default_scanners};
@@ -26,7 +27,10 @@ pub enum Msg {
         cancelled: bool,
     },
     Cleaned(CleanResult),
-    CleanDone,
+    /// A clean finished; `disk_gain` is the measured change in free space of the home volume.
+    CleanDone {
+        disk_gain: Option<i64>,
+    },
     /// Largest children of a finding's folder, for the details panel.
     Breakdown {
         id: String,
@@ -111,10 +115,11 @@ pub fn spawn_empty_trash(os: Os, home: PathBuf, notifier: Notifier) {
         let scanners: [Box<dyn Scanner>; 1] = [Box::new(TrashScanner)];
         let findings = run_scan(&ctx, &scanners, &|_| {});
         let audit = default_audit_log(os, &home);
+        let before = disk::space(&home);
         clean_findings(os, &home, &findings, DeleteMode::Permanent, &audit, Elevation::Prompt, &mut |result| {
             notifier.send(Msg::Cleaned(result));
         });
-        notifier.send(Msg::CleanDone);
+        notifier.send(Msg::CleanDone { disk_gain: disk::gained(before, disk::space(&home)) });
     });
     if let Err(e) = spawned {
         tracing::error!(error = %e, "failed to start empty-trash thread");
@@ -124,10 +129,11 @@ pub fn spawn_empty_trash(os: Os, home: PathBuf, notifier: Notifier) {
 pub fn spawn_clean(os: Os, home: PathBuf, findings: Vec<Finding>, mode: DeleteMode, notifier: Notifier) {
     let spawned = thread::Builder::new().name("diskdust-clean".into()).spawn(move || {
         let audit = default_audit_log(os, &home);
+        let before = disk::space(&home);
         clean_findings(os, &home, &findings, mode, &audit, Elevation::Prompt, &mut |result| {
             notifier.send(Msg::Cleaned(result));
         });
-        notifier.send(Msg::CleanDone);
+        notifier.send(Msg::CleanDone { disk_gain: disk::gained(before, disk::space(&home)) });
     });
     if let Err(e) = spawned {
         tracing::error!(error = %e, "failed to start clean thread");
