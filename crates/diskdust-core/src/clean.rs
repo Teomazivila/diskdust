@@ -171,22 +171,38 @@ impl Cleaner<'_> {
     }
 }
 
-/// Whether `app` is running, according to `pgrep`. `false` when `pgrep` is unavailable.
-pub fn is_running(runner: &dyn CommandRunner, app: &RunningApp) -> bool {
+/// Whether an app is running, according to `pgrep`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunState {
+    Running,
+    NotRunning,
+    /// `pgrep` is missing, timed out or failed: treated as "maybe running" (fail closed).
+    Unknown(String),
+}
+
+/// Checks `app` with `pgrep`, which exits 0 when a process matched and 1 when none did; any
+/// other outcome is [`RunState::Unknown`].
+pub fn run_state(runner: &dyn CommandRunner, app: &RunningApp) -> RunState {
     let argv: Vec<String> = std::iter::once("pgrep".to_owned()).chain(app.pgrep.iter().cloned()).collect();
     match runner.run(&argv, Duration::from_secs(5)) {
-        Ok(out) => out.success,
-        Err(e) => {
-            tracing::warn!(error = %e, app = %app.app, "could not check whether the app is running");
-            false
-        }
+        Ok(out) if out.success => RunState::Running,
+        Ok(out) if out.code == Some(1) => RunState::NotRunning,
+        Ok(out) => RunState::Unknown(format!("pgrep exited with {:?}: {}", out.code, out.stderr.trim())),
+        Err(e) => RunState::Unknown(e.to_string()),
     }
 }
 
-/// Reason to skip `finding` because the app owning its data is running, if any.
+/// Reason to skip `finding` because the app owning its data is (or may be) running, if any.
 pub fn quit_first_reason(runner: &dyn CommandRunner, finding: &Finding) -> Option<String> {
     let app = finding.quit_first.as_ref()?;
-    is_running(runner, app).then(|| format!("{} is running. Quit it, then clean again.", app.app))
+    match run_state(runner, app) {
+        RunState::NotRunning => None,
+        RunState::Running => Some(format!("{} is running. Quit it, then clean again.", app.app)),
+        RunState::Unknown(why) => {
+            tracing::warn!(app = %app.app, error = %why, "could not check whether the app is running");
+            Some(format!("Could not check whether {} is running ({why}). Quit it, then clean again.", app.app))
+        }
+    }
 }
 
 /// Last `max` characters of `text`, trimmed.
@@ -480,7 +496,22 @@ pub(crate) mod tests {
         );
         let stopped = FakeRunner::new().respond("pgrep -f Slack.app/Contents/MacOS/", false, "");
         assert!(quit_first_reason(&stopped, &finding).is_none());
-        assert!(!is_running(&FakeRunner::new(), &slack), "missing pgrep never blocks");
+        assert_eq!(run_state(&stopped, &slack), RunState::NotRunning);
+    }
+
+    #[test]
+    fn running_app_check_fails_closed() {
+        let slack = RunningApp { app: "Slack".into(), pgrep: vec!["-f".into(), "Slack.app/Contents/MacOS/".into()] };
+        let mut finding = crate::scanners::testutil::sample_finding();
+        finding.quit_first = Some(slack.clone());
+        let missing = FakeRunner::new();
+        assert!(matches!(run_state(&missing, &slack), RunState::Unknown(_)), "missing pgrep");
+        for code in [2, 3] {
+            let broken = FakeRunner::new().respond_code("pgrep -f Slack.app/Contents/MacOS/", code, "");
+            assert!(matches!(run_state(&broken, &slack), RunState::Unknown(_)), "exit {code}");
+            let reason = quit_first_reason(&broken, &finding).expect("blocked");
+            assert!(reason.starts_with("Could not check whether Slack is running"), "{reason}");
+        }
     }
 
     #[test]

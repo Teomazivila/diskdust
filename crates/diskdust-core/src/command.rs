@@ -184,6 +184,15 @@ pub(crate) mod fake {
         }
 
         /// Registers `program` as installed and scripts the output for the exact command line.
+        /// Like [`Self::respond`] with an explicit exit code (0 = success).
+        pub fn respond_code(self, cmdline: &str, code: i32, stdout: &str) -> Self {
+            let mut runner = self.respond(cmdline, code == 0, stdout);
+            if let Some(out) = runner.responses.get_mut(cmdline) {
+                out.code = Some(code);
+            }
+            runner
+        }
+
         pub fn respond(mut self, cmdline: &str, success: bool, stdout: &str) -> Self {
             let program = cmdline.split_whitespace().next().unwrap_or_default().to_owned();
             if !self.installed.contains(&program) {
