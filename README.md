@@ -54,7 +54,7 @@ For the terminal commands on macOS, link the binary onto your `PATH`, e.g.
 
 | Category | macOS | Linux |
 |---|---|---|
-| Containers | Unused Docker images, stopped containers, unused volumes, build cache (`docker system df`); `Docker.raw`, Lima / Colima VM disks (info) | same (Lima / Colima where installed) |
+| Containers | Each unused Docker image and volume on its own (removed with `docker image rm` / `docker volume rm`), stopped containers, build cache (`docker system df`); `Docker.raw`, Lima / Colima VM disks (info) | same (Lima / Colima where installed) |
 | App caches | `~/Library/Caches/*`, Slack / VS Code / Cursor / Discord / Chrome caches | `~/.cache/*`, Slack / VS Code / Discord / Chrome under `~/.config` |
 | Logs | `~/Library/Logs/*`, `/Library/Logs/*` 🔒 | systemd journal (`journalctl --vacuum-time=7d`) 🔒 |
 | Developer caches | Cargo, npm, pnpm, Yarn, Bun, pip, uv, Gradle, Maven, Helm, Deno, Playwright, CocoaPods, JetBrains, Terraform, minikube, Hugging Face, Ollama, Homebrew (`brew cleanup`), Go (`go clean`) | same (XDG paths) |
@@ -64,6 +64,8 @@ For the terminal commands on macOS, link the binary onto your `PATH`, e.g.
 | Xcode | DerivedData, Archives, device support, simulator caches, unavailable simulators | — |
 | Device backups | iPhone/iPad backups | — |
 | Orphaned app data | `Application Support`, `Saved Application State`, `HTTPStorages`, `WebKit` folders of bundle ids with no installed app | — |
+| Large files (opt-in) | Files of 1 GB+ anywhere in your home folder that no other rule explains | same |
+| Duplicates | Identical files in `~/Downloads` (byte-for-byte); the oldest copy is kept | same |
 | Trash | `~/.Trash` | `~/.local/share/Trash` |
 | System 🔒 | `/Library/Caches/*`, Time Machine local snapshots | APT, DNF, DNF5, pacman caches; disabled snap revisions |
 
@@ -84,12 +86,46 @@ was last modified.
 - **Details panel** (click a row): what cleaning does, the full explanation, and *Largest folders*
   inside the item.
 - **Ignore** items for good (row context menu or details panel); *Show ignored* brings them back.
+- **Find large files** (sidebar, off by default): also lists files of 1 GB+ in your home folder that
+  no other rule explains. All are *Review*; hidden folders, `.git`, `~/Library`, the Trash and photo,
+  music or VM libraries are never searched. On macOS it asks for access to Desktop, Pictures, Movies, ….
 - **Running-app guard**: Slack, VS Code, Cursor, Discord, Chrome caches and Xcode DerivedData are
   skipped while the app runs; the confirmation dialog says which apps to quit.
 - **Free space** of your home volume in the toolbar, **Empty Trash** after a Trash-mode clean, and a
   **History** of past cleanups (from the audit log).
+- **Weekly reminder** (sidebar): every Monday at 10:00 a read-only scan runs and notifies you when
+  5 GB or more can be freed. It is a per-user LaunchAgent (`~/Library/LaunchAgents/dev.diskdust.report.plist`)
+  or systemd user timer (`~/.config/systemd/user/diskdust-report.timer`); nothing is ever cleaned
+  automatically.
+- **Undo**: *History* offers to put back what the last Trash-mode clean moved to the Trash (Linux,
+  and `diskdust undo`). Nothing is overwritten: an item whose original path exists again stays in
+  the Trash. macOS has no API for this, so there *History* lists the items and opens the Trash for
+  you to drag them back.
+- **Your own rules**: add folders no built-in rule knows to `settings.json` (see below).
 - Project folders, delete mode, age filter and ignored items are saved in `settings.json`
   (`~/Library/Application Support/diskdust/` on macOS, `$XDG_CONFIG_HOME/diskdust/` on Linux).
+
+### Your own rules
+
+Add `custom_rules` to `settings.json` to report folders that are specific to you:
+
+```json
+{
+  "custom_rules": [
+    { "path": "~/Projects/old-renders", "mode": "children", "title": "Old renders" },
+    { "path": "~/Library/Caches/SomeApp", "risk": "safe" }
+  ]
+}
+```
+
+- `path`: `~/…` or an absolute path **inside your home folder** (system paths are refused).
+- `mode`: `whole` (default, one item) or `children` (one item per entry inside the folder).
+- `risk`: `review` (default) or `safe` (then *Select safe* picks it).
+- `title`: optional label.
+
+Results appear under **Your rules** and follow every safety rule above. A rule naming a protected
+folder (`~/Documents` itself, `~/.ssh`, …) or a path outside your home is skipped and shown as
+*Rule skipped* with the reason. The app keeps your rules when it saves other settings.
 
 ## Safety model
 
@@ -101,6 +137,9 @@ was last modified.
   absolute, exist, not be a symlink, lie strictly inside its declared root after resolving
   symlinks, and must not be (or contain) a protected location (`/`, `$HOME`, `/System`, `/usr`,
   `~/Documents`, `~/.ssh`, …). Walks never follow symlinks or cross file systems.
+- **Duplicates keep one copy.** A duplicate is removed only if its kept copy still exists with
+  identical contents (checked byte for byte just before), and duplicates run last in a clean, so
+  removing the original in the same clean keeps the copy.
 - **No arbitrary commands.** External tools run from a closed list of fixed argument vectors;
   arguments derived from scanned data (snap names, rustup toolchain names) are validated.
 - **The GUI never runs as root.** Admin items are passed (hex-encoded, typed) to
@@ -118,12 +157,16 @@ was last modified.
 diskdust                                   # open the desktop app
 diskdust scan [filters] [--json]           # read-only report in the terminal
 diskdust clean [filters] --dry-run         # list what would be cleaned
+diskdust undo [--dry-run]                  # put back what the last Trash-mode clean moved (Linux)
+diskdust report [--notify] [--min-gb N]    # read-only summary, optional desktop notification
+diskdust schedule install|remove|status    # weekly report (Monday 10:00), never cleans
 diskdust clean [filters] --yes [--include-review] [--permanent] [--json]
 ```
 
 Filters: `--category <name>` (repeatable: `containers`, `developer-caches`, `old-toolchains`,
-`build-artifacts`, `installers`, `app-caches`, `logs`, `xcode`, `device-backups`,
-`orphaned-app-data`, `trash`, `system`), `--safe-only`, `--older-than <days>`.
+`build-artifacts`, `installers`, `large-files`, `your-rules`, `duplicates`, `app-caches`, `logs`, `xcode`, `device-backups`,
+`orphaned-app-data`, `trash`, `system`), `--safe-only`, `--older-than <days>`; `--large-files`
+also searches your home folder for large files.
 
 `diskdust clean` follows the same safety rules as the app: Trash by default, ignored items are never
 touched, running apps block their caches and every attempt is audited. Admin items are never
@@ -132,7 +175,8 @@ not included rather than counted as failures. On top of that it is conservative 
 
 - only items marked **Safe** are cleaned; items marked **Review** (Docker volumes, device backups,
   old toolchains, …) need `--include-review`;
-- the Trash is emptied (always permanently) only when you ask for it with `--category trash`.
+- the Trash is emptied (always permanently) only when you ask for it with `--category trash`, and
+  large files are cleaned only with `--category large-files`.
 
 It prints which matching items it left out and why, and exits with status 1 when any item was not
 cleaned. Example:

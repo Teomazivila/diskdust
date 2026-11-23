@@ -1,8 +1,11 @@
 //! Scanners discover reclaimable items. Scanners only read; they never modify anything.
 
 mod artifacts;
+mod custom;
 mod docker;
+mod duplicates;
 mod installers;
+mod large_files;
 mod orphans;
 mod paths;
 mod toolchains;
@@ -21,8 +24,11 @@ use crate::model::{Category, Finding, GENERIC, Os, Privilege, Risk};
 use crate::size::{self, SizeReport};
 
 pub use artifacts::BuildArtifactsScanner;
+pub use custom::{CustomMode, CustomRisk, CustomRule, CustomRulesScanner};
 pub use docker::DockerScanner;
+pub use duplicates::{DuplicatesScanner, same_contents};
 pub use installers::InstallersScanner;
+pub use large_files::{LARGE_FILE_MIN, LargeFilesScanner};
 pub use orphans::OrphanedAppDataScanner;
 pub use paths::{Base, Mode, PathRule, PathRulesScanner, default_rules, resolved_rule_paths};
 pub use toolchains::ToolchainsScanner;
@@ -154,11 +160,33 @@ pub fn default_scanners() -> Vec<Box<dyn Scanner>> {
         Box::new(BuildArtifactsScanner),
         Box::new(ToolchainsScanner),
         Box::new(InstallersScanner),
+        Box::new(DuplicatesScanner),
         Box::new(VmDisksScanner),
         Box::new(TimeMachineScanner),
         Box::new(JournalScanner),
         Box::new(SnapScanner),
     ]
+}
+
+/// User choices that add scanners to the built-in ones.
+#[derive(Debug, Clone, Default)]
+pub struct ScanOptions {
+    /// Opt-in search for large files in the home folder.
+    pub large_files: bool,
+    /// Rules from `settings.json`.
+    pub custom_rules: Vec<CustomRule>,
+}
+
+/// The built-in scanners plus the ones `options` asks for.
+pub fn scanners_for(options: &ScanOptions) -> Vec<Box<dyn Scanner>> {
+    let mut scanners = default_scanners();
+    if options.large_files {
+        scanners.push(Box::new(LargeFilesScanner::default()));
+    }
+    if !options.custom_rules.is_empty() {
+        scanners.push(Box::new(CustomRulesScanner { rules: options.custom_rules.clone() }));
+    }
+    scanners
 }
 
 /// Appends a note when part of an item is hard-linked from elsewhere and is not freed by removing

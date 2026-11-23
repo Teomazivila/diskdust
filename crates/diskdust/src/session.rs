@@ -51,13 +51,18 @@ fn empties_trash(finding: &Finding) -> bool {
     matches!(finding.action, Some(CleanupAction::EmptyDir { .. } | CleanupAction::Run(KnownCommand::FinderEmptyTrash)))
 }
 
-/// User-level findings in execution order. Emptying the Trash always runs **first**: otherwise
-/// items moved to the Trash earlier in the same run would be erased with it, silently turning a
-/// recoverable "Move to Trash" into a permanent delete.
+/// User-level findings in execution order:
+/// - emptying the Trash runs **first**, otherwise items moved to the Trash earlier in the same
+///   run would be erased with it, turning a recoverable "Move to Trash" into a permanent delete;
+/// - duplicates run **last**, so if their kept copy is removed by another item of the same run,
+///   the duplicate's check sees it is gone and keeps the last copy.
 fn user_order<'a>(findings: &[&'a Finding]) -> Vec<&'a Finding> {
-    let (mut first, rest): (Vec<&Finding>, Vec<&Finding>) = findings.iter().partition(|f| empties_trash(f));
-    first.extend(rest);
-    first
+    let is_duplicate = |f: &&Finding| matches!(f.action, Some(CleanupAction::RemoveDuplicate { .. }));
+    let (mut ordered, rest): (Vec<&Finding>, Vec<&Finding>) = findings.iter().partition(|f| empties_trash(f));
+    let (duplicates, others): (Vec<&Finding>, Vec<&Finding>) = rest.into_iter().partition(is_duplicate);
+    ordered.extend(others);
+    ordered.extend(duplicates);
+    ordered
 }
 
 /// Cleans every actionable finding, calling `on_result` once per item, in order: Trash-emptying
@@ -79,8 +84,10 @@ pub fn clean_findings(
     let run_id = AuditEntry::new_run_id();
     tracing::info!(run_id = %run_id, items = findings.len(), ?mode, "clean started");
     let mut report = |finding: &Finding, action: &CleanupAction, ok: bool, message: String, elevated: bool| {
-        let trashed =
-            ok && !elevated && mode == DeleteMode::Trash && matches!(action, CleanupAction::RemovePath { .. });
+        let trashed = ok
+            && !elevated
+            && mode == DeleteMode::Trash
+            && matches!(action, CleanupAction::RemovePath { .. } | CleanupAction::RemoveDuplicate { .. });
         let bytes = reclaimed_bytes(finding, action, ok, &message);
         let entry = AuditEntry {
             timestamp: AuditEntry::now(),
@@ -274,5 +281,40 @@ mod tests {
         finder.action = Some(CleanupAction::Run(KnownCommand::FinderEmptyTrash));
         let ordered: Vec<_> = user_order(&[&other, &finder]).iter().map(|f| f.id.as_str()).collect();
         assert_eq!(ordered, ["trash", "a"]);
+    }
+
+    #[test]
+    fn a_duplicate_never_outlives_its_original_in_one_clean() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let home = home.path().canonicalize().expect("canonical");
+        let dl = home.join("Downloads");
+        std::fs::create_dir_all(&dl).expect("mkdir");
+        let original = dl.join("a.iso");
+        let copy = dl.join("a (1).iso");
+        std::fs::write(&original, vec![1u8; 8192]).expect("write");
+        std::fs::write(&copy, vec![1u8; 8192]).expect("write");
+        // The copy is listed first (as if larger); the original is also selected via another rule.
+        let mut dup = finding(Some(8192));
+        dup.id = "dup".into();
+        dup.action =
+            Some(CleanupAction::RemoveDuplicate { path: copy.clone(), root: dl.clone(), original: original.clone() });
+        let mut orig = finding(Some(8192));
+        orig.id = "orig".into();
+        orig.action = Some(CleanupAction::RemovePath { path: original.clone(), root: dl.clone() });
+        let audit = AuditLog::new(home.join("audit.jsonl"));
+        let mut results = Vec::new();
+        clean_findings(
+            Os::current().expect("os"),
+            &home,
+            &[dup, orig],
+            DeleteMode::Permanent,
+            &audit,
+            Elevation::Skip,
+            &mut |r| {
+                results.push((r.id, r.ok));
+            },
+        );
+        assert_eq!(results, [("orig".to_owned(), true), ("dup".to_owned(), false)], "duplicate runs last and is kept");
+        assert!(copy.exists(), "one copy always survives");
     }
 }

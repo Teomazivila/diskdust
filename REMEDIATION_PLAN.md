@@ -110,3 +110,19 @@ on `fix/review-2`; every fix has a regression test (or, for workflows, a local e
 
 Owner actions: add required reviewers to the `release` environment and enable branch protection
 on `main` (R5).
+
+## 7. Features after the second review (`feat/more-features`, stacked on `fix/review-2`)
+
+| ID | Feature | Scope | Status |
+|---|---|---|---|
+| F12 | Measured space freed | Free space of the home volume before/after each clean, shown as "free space +X (measured)" in the app and CLI | ✅ `14833c0` |
+| F13 | Large files (opt-in) | Files ≥ 1 GB in the home folder no rule explains; Review; never inside hidden folders, `.git`, `~/Library`, Trash or packages/libraries; CLI needs `--category large-files` | ✅ `fb13f15` |
+| F14 | Docker items one by one | Each unused image (`docker image rm <id>`, unique size, age) and volume (`docker volume rm <name>`) from `docker system df -v`; validated ids/names; prune fallback | ✅ `7fbf9c8` |
+| F15 | Your own rules | `custom_rules` in `settings.json`, confined to home, same safety policy, protected folders refused, skipped rules shown | ✅ `98ee470` |
+| F16 | Undo | History / `diskdust undo` restore the last Trash-mode clean on Linux (never overwrite); macOS lists items and opens the Trash | ✅ `127bfbb` |
+| F17 | More targets | Homebrew sized by its own cleanup estimate (covers autoremove and old cask versions); duplicate files in Downloads with a re-verified `RemoveDuplicate` action that never removes the last copy | ✅ `14ecde7`, `2698135` |
+| F18 | Weekly report | `diskdust report`, `diskdust schedule`, sidebar toggle; LaunchAgent / systemd user timer; read-only | ✅ `157a45d` |
+
+Considered and not added: Messages attachments (deleting files directly breaks Messages' database;
+macOS Storage settings manage them; needs Full Disk Access) and Mail Downloads (another app's
+container, same consent issue as the deferred sandboxed caches).

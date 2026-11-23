@@ -86,7 +86,7 @@ pub fn dedupe_overlaps(findings: Vec<Finding>) -> Vec<Finding> {
 mod tests {
     use super::*;
     use crate::command::fake::FakeRunner;
-    use crate::model::{Category, GENERIC, Os, Privilege, Risk, SPECIFIC};
+    use crate::model::{Category, GENERIC, LOWEST, Os, Privilege, Risk, SPECIFIC};
     use crate::scanners::testutil::{BIG, Env};
     use crate::scanners::{ScanError, default_scanners};
     use std::path::PathBuf;
@@ -121,6 +121,16 @@ mod tests {
             finding("specific", "/h/.cache/pip", SPECIFIC, 1),
         ]);
         assert_eq!(ids(&out), ["specific"]);
+    }
+
+    #[test]
+    fn large_files_never_double_count_other_findings() {
+        let out = dedupe_overlaps(vec![
+            finding("large", "/h/Library/Caches/app/blob.bin", LOWEST, 5),
+            finding("cache", "/h/Library/Caches/app", GENERIC, 6),
+            finding("movie", "/h/Movies/a.mov", LOWEST, 7),
+        ]);
+        assert_eq!(ids(&out), ["cache", "movie"]);
     }
 
     #[test]

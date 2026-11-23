@@ -10,8 +10,9 @@ use std::time::Instant;
 
 use diskdust_core::clean::DeleteMode;
 use diskdust_core::model::{Category, CleanupAction, Finding, Os, Privilege, Risk};
+use diskdust_core::restore::{MACOS_RESTORE_HINT, Restored, Trashed, last_trash_run, trashed_in_run};
 use diskdust_core::scan::ScanEvent;
-use diskdust_core::scanners::{default_project_roots, unique_dirs};
+use diskdust_core::scanners::{CustomRule, LARGE_FILE_MIN, ScanOptions, default_project_roots, unique_dirs};
 use egui::{Align, Color32, Layout, RichText, Sense, vec2};
 use egui_extras::{Column, TableBuilder};
 
@@ -76,6 +77,21 @@ struct CleanTally {
     trashed: u64,
     ok: usize,
     failed: usize,
+    /// Measured change in free space of the home volume over the clean.
+    disk_gain: Option<i64>,
+}
+
+/// Where a scan looks beyond the built-in locations.
+#[derive(Debug, Clone)]
+struct SearchScope {
+    /// Folders searched for build artifacts.
+    project_roots: Vec<PathBuf>,
+    /// True once the user changed `project_roots`; then the defaults no longer apply.
+    customized: bool,
+    /// Opt-in search for large files in the home folder.
+    large_files: bool,
+    /// Rules from settings.json; not edited in the app but always written back unchanged.
+    custom_rules: Vec<CustomRule>,
 }
 
 #[derive(Debug)]
@@ -92,7 +108,10 @@ pub struct DiskdustApp {
     ignored: std::collections::BTreeSet<String>,
     show_ignored: bool,
     /// True once the user edited the project folders (then they are persisted).
-    roots_customized: bool,
+    /// What a scan searches beyond the built-in locations.
+    scope: SearchScope,
+    /// Whether the weekly read-only report is installed (`LaunchAgent` / systemd user timer).
+    weekly_report: bool,
     store: SettingsStore,
     /// Last settings written, to save only on change.
     saved: Settings,
@@ -108,7 +127,6 @@ pub struct DiskdustApp {
     /// macOS Full Disk Access as probed at start; `None` once dismissed or when not applicable.
     full_disk_access: Option<bool>,
     mode: DeleteMode,
-    project_roots: Vec<PathBuf>,
     phase: Phase,
     cancel: Arc<AtomicBool>,
     notifier: Notifier,
@@ -137,10 +155,15 @@ impl DiskdustApp {
             older_than: saved.older_than,
             ignored: saved.ignored.clone(),
             show_ignored: false,
-            roots_customized,
+            weekly_report: false,
+            scope: SearchScope {
+                project_roots,
+                customized: roots_customized,
+                large_files: saved.large_files,
+                custom_rules: saved.custom_rules.clone(),
+            },
             store,
             mode: saved.mode.unwrap_or(DeleteMode::Trash),
-            project_roots,
             phase: Phase::Welcome,
             cancel: Arc::new(AtomicBool::new(false)),
             notifier: Notifier::new(tx, cc.egui_ctx.clone()),
@@ -160,6 +183,34 @@ impl DiskdustApp {
         .with_disk_space()
         .with_access_probe()
         .with_settings_problem(settings_problem)
+        .with_schedule_state()
+    }
+
+    fn with_schedule_state(mut self) -> Self {
+        self.weekly_report = crate::schedule::is_installed(self.os, &self.home);
+        self
+    }
+
+    /// Installs or removes the weekly report after the sidebar toggle changed.
+    fn apply_weekly_report(&mut self) {
+        let runner = diskdust_core::command::SystemRunner::new(&self.home);
+        let result = if self.weekly_report {
+            std::env::current_exe()
+                .map_err(|e| format!("cannot locate the diskdust executable: {e}"))
+                .and_then(|exe| crate::schedule::install(self.os, &self.home, &exe, &runner))
+        } else {
+            crate::schedule::remove(self.os, &self.home, &runner)
+        };
+        match result {
+            Ok(()) if self.weekly_report => {
+                self.log(true, "Weekly report on: diskdust will check on Mondays at 10:00 and notify you.".into());
+            }
+            Ok(()) => self.log(true, "Weekly report off.".into()),
+            Err(e) => {
+                self.log(false, format!("Could not change the weekly report: {e}"));
+                self.weekly_report = crate::schedule::is_installed(self.os, &self.home);
+            }
+        }
     }
 
     /// Keeps an unreadable settings file safe before anything is saved over it, and says so.
@@ -229,6 +280,33 @@ impl DiskdustApp {
         }
     }
 
+    fn on_restored(&mut self, result: Result<Vec<(Trashed, Restored)>, String>) {
+        match result {
+            Err(e) => {
+                self.log(false, e.clone());
+                self.status = e;
+            }
+            Ok(outcomes) => {
+                let restored = outcomes.iter().filter(|(_, o)| *o == Restored::Restored).count();
+                for (item, outcome) in outcomes {
+                    let ok = outcome == Restored::Restored;
+                    let text = match outcome {
+                        Restored::Restored => "restored".to_owned(),
+                        Restored::NotInTrash => {
+                            "not in the Trash any more (already restored, or the Trash was emptied)".to_owned()
+                        }
+                        Restored::PathExists => "left in the Trash: something exists at that path again".to_owned(),
+                        Restored::Failed(e) => e,
+                    };
+                    self.log(ok, format!("{} — {text}", item.path.display()));
+                }
+                self.status =
+                    format!("Restored {} from the Trash. Rescan to update the list.", format::items(restored));
+            }
+        }
+        self.refresh_disk();
+    }
+
     fn start_empty_trash(&mut self) {
         self.offer_empty_trash = false;
         self.tally = CleanTally::default();
@@ -239,7 +317,10 @@ impl DiskdustApp {
 
     fn history_window(&mut self, ctx: &egui::Context) {
         let Some(entries) = &self.history else { return };
+        let os = self.os;
         let mut open = true;
+        let mut undo: Option<Vec<Trashed>> = None;
+        let mut open_trash = false;
         egui::Window::new("Cleanup history")
             .open(&mut open)
             .anchor(egui::Align2::CENTER_TOP, vec2(0.0, 70.0))
@@ -250,6 +331,23 @@ impl DiskdustApp {
                 if entries.is_empty() {
                     ui.label(RichText::new("Nothing has been cleaned yet.").weak());
                     return;
+                }
+                if let Some(run) = last_trash_run(entries) {
+                    let items = trashed_in_run(entries, &run);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(format!("The last clean moved {} to the Trash.", format::items(items.len())));
+                        if os == Os::Linux {
+                            if ui.button("Undo: put them back").clicked() {
+                                undo = Some(items.clone());
+                            }
+                        } else {
+                            if ui.button("Open Trash").clicked() {
+                                open_trash = true;
+                            }
+                            ui.label(RichText::new(MACOS_RESTORE_HINT).weak().small());
+                        }
+                    });
+                    ui.separator();
                 }
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     egui::Grid::new("history-grid").striped(true).num_columns(4).spacing(vec2(12.0, 4.0)).show(
@@ -272,6 +370,16 @@ impl DiskdustApp {
             });
         if !open {
             self.history = None;
+        }
+        if let Some(items) = undo {
+            self.status = format!("Restoring {} from the Trash…", format::items(items.len()));
+            worker::spawn_restore(items, self.notifier.clone());
+        }
+        if open_trash {
+            let trash = self.home.join(".Trash");
+            if let Err(e) = opener::open(&trash) {
+                self.log(false, format!("Could not open the Trash: {e}"));
+            }
         }
     }
 
@@ -309,10 +417,12 @@ impl DiskdustApp {
 
     fn current_settings(&self) -> Settings {
         Settings {
-            project_roots: self.roots_customized.then(|| self.project_roots.clone()),
+            project_roots: self.scope.customized.then(|| self.scope.project_roots.clone()),
             mode: Some(self.mode),
             older_than: self.older_than,
             ignored: self.ignored.clone(),
+            large_files: self.scope.large_files,
+            custom_rules: self.scope.custom_rules.clone(),
         }
     }
 
@@ -322,7 +432,9 @@ impl DiskdustApp {
         let unchanged = current.project_roots == self.saved.project_roots
             && current.mode.unwrap_or(DeleteMode::Trash) == self.saved.mode.unwrap_or(DeleteMode::Trash)
             && current.older_than == self.saved.older_than
-            && current.ignored == self.saved.ignored;
+            && current.ignored == self.saved.ignored
+            && current.large_files == self.saved.large_files
+            && current.custom_rules == self.saved.custom_rules;
         if unchanged {
             return;
         }
@@ -490,7 +602,8 @@ impl DiskdustApp {
         worker::spawn_scan(
             self.os,
             self.home.clone(),
-            self.project_roots.clone(),
+            self.scope.project_roots.clone(),
+            ScanOptions { large_files: self.scope.large_files, custom_rules: self.scope.custom_rules.clone() },
             Arc::clone(&self.cancel),
             self.notifier.clone(),
         );
@@ -544,7 +657,9 @@ impl DiskdustApp {
                         self.breakdown = Breakdown::Ready(id, entries);
                     }
                 }
-                Msg::CleanDone => {
+                Msg::Restored(result) => self.on_restored(result),
+                Msg::CleanDone { disk_gain } => {
+                    self.tally.disk_gain = disk_gain;
                     self.status = clean_summary(&self.tally);
                     self.phase = Phase::Idle;
                     self.offer_empty_trash = self.tally.trashed > 0;
@@ -724,7 +839,7 @@ impl DiskdustApp {
         ui.label(RichText::new("Project folders").strong())
             .on_hover_text("Searched for target/, node_modules/ and other build output");
         let mut remove = None;
-        for (i, root) in self.project_roots.iter().enumerate() {
+        for (i, root) in self.scope.project_roots.iter().enumerate() {
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(!self.busy(), egui::Button::new(ICON_REMOVE).small())
@@ -738,16 +853,40 @@ impl DiskdustApp {
             });
         }
         if let Some(i) = remove {
-            self.project_roots.remove(i);
-            self.roots_customized = true;
+            self.scope.project_roots.remove(i);
+            self.scope.customized = true;
         }
         if ui.add_enabled(!self.busy(), egui::Button::new("Add folder…")).clicked()
             && let Some(folder) = rfd::FileDialog::new().set_directory(&self.home).pick_folder()
         {
-            let mut roots = self.project_roots.clone();
+            let mut roots = self.scope.project_roots.clone();
             roots.push(folder);
-            self.project_roots = unique_dirs(roots);
-            self.roots_customized = true;
+            self.scope.project_roots = unique_dirs(roots);
+            self.scope.customized = true;
+        }
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_enabled(
+            !self.busy(),
+            egui::Checkbox::new(
+                &mut self.scope.large_files,
+                format!("Find large files ({}+)", format::bytes(LARGE_FILE_MIN)),
+            ),
+        )
+        .on_hover_text(
+            "Also search your home folder for large files no other rule explains (applies on the next scan). \
+             On macOS this asks for access to Desktop, Pictures, Movies and other folders. Hidden folders, \
+             Library and photo or VM libraries are never searched.",
+        );
+        if ui
+            .checkbox(&mut self.weekly_report, "Weekly reminder")
+            .on_hover_text(
+                "Every Monday at 10:00, scan (read-only) and show a notification when 5 GB or more can be freed. \
+                 Nothing is cleaned automatically.",
+            )
+            .changed()
+        {
+            self.apply_weekly_report();
         }
     }
 
@@ -803,7 +942,7 @@ impl DiskdustApp {
                 )
                 .weak(),
             );
-            if let Some(note) = privacy_prompt_note(self.os, &self.home, &self.project_roots) {
+            if let Some(note) = privacy_prompt_note(self.os, &self.home, &self.scope.project_roots) {
                 ui.add_space(8.0);
                 ui.label(RichText::new(note).small().color(INFO));
             }
@@ -1124,7 +1263,8 @@ fn age_filter_label(days: Option<u32>) -> String {
 /// Items that bypass the Trash even in Trash mode: emptying a trash folder, tool commands
 /// (Docker, Homebrew, …) and admin items run by the privileged helper.
 fn removed_permanently_in_trash_mode(f: &Finding) -> bool {
-    f.privilege == Privilege::Admin || !matches!(f.action, Some(CleanupAction::RemovePath { .. }))
+    f.privilege == Privilege::Admin
+        || !matches!(f.action, Some(CleanupAction::RemovePath { .. } | CleanupAction::RemoveDuplicate { .. }))
 }
 
 /// "2 items are removed permanently, not moved to the Trash: A, B." (at most 4 names).
@@ -1185,6 +1325,9 @@ fn clean_summary(t: &CleanTally) -> String {
     }
     if t.failed > 0 {
         let _ = write!(status, " · {} failed (see Activity)", t.failed);
+    }
+    if let Some(gain) = t.disk_gain {
+        let _ = write!(status, " · free space {} (measured)", format::signed_bytes(gain));
     }
     status
 }
@@ -1265,6 +1408,14 @@ fn action_description(f: &Finding, mode: DeleteMode) -> String {
             DeleteMode::Trash => "Moved to the Trash.".to_owned(),
             DeleteMode::Permanent => "Deleted permanently.".to_owned(),
         },
+        Some(CleanupAction::RemoveDuplicate { original, .. }) => format!(
+            "{} only if {} still exists with identical contents (checked just before).",
+            match mode {
+                DeleteMode::Trash => "Moved to the Trash",
+                DeleteMode::Permanent => "Deleted permanently",
+            },
+            original.display()
+        ),
     }
 }
 
@@ -1388,9 +1539,11 @@ mod tests {
 
     #[test]
     fn clean_summary_mentions_trash_and_failures() {
-        let t = CleanTally { freed: 2_000_000_000, trashed: 0, ok: 3, failed: 0 };
+        let t = CleanTally { freed: 2_000_000_000, trashed: 0, ok: 3, failed: 0, disk_gain: None };
         assert_eq!(clean_summary(&t), "Cleaned 3 items, freed 2.0 GB");
-        let t = CleanTally { freed: 0, trashed: 5_000_000, ok: 1, failed: 2 };
+        let t = CleanTally { disk_gain: Some(2_100_000_000), ..t };
+        assert_eq!(clean_summary(&t), "Cleaned 3 items, freed 2.0 GB · free space +2.1 GB (measured)");
+        let t = CleanTally { freed: 0, trashed: 5_000_000, ok: 1, failed: 2, disk_gain: None };
         assert_eq!(
             clean_summary(&t),
             "Cleaned 1 item, freed 0 B · 5.0 MB moved to Trash (empty the Trash to reclaim it) · 2 failed (see Activity)"
@@ -1695,6 +1848,10 @@ mod tests {
                     mode: Some(DeleteMode::Permanent),
                     older_than: Some(90),
                     ignored: ["x".to_owned()].into(),
+                    large_files: true,
+                    custom_rules: vec![
+                        serde_json::from_str(r#"{"path":"~/renders","mode":"children"}"#).expect("rule"),
+                    ],
                 })
                 .expect("seed");
             let home_path = home.path().to_path_buf();
@@ -1705,13 +1862,15 @@ mod tests {
             let state = harness.state();
             assert_eq!(state.mode, DeleteMode::Permanent);
             assert_eq!(state.older_than, Some(90));
-            assert_eq!(state.project_roots, vec![code.canonicalize().expect("canonical")]);
+            assert_eq!(state.scope.project_roots, vec![code.canonicalize().expect("canonical")]);
             assert!(state.ignored.contains("x"));
             harness.get_by_label("Move to Trash").click();
             harness.run();
             let saved = SettingsStore::at(path).load().settings;
             assert_eq!(saved.mode, Some(DeleteMode::Trash));
             assert_eq!(saved.older_than, Some(90));
+            assert_eq!(saved.custom_rules.len(), 1, "custom rules survive the app saving other settings");
+            assert_eq!(saved.custom_rules[0].path, "~/renders");
         }
 
         #[test]
@@ -1736,6 +1895,60 @@ mod tests {
             let saved = SettingsStore::at(path).load();
             assert_eq!(saved.problem, None, "the new file is valid");
             assert_eq!(saved.settings.older_than, Some(30));
+        }
+
+        #[test]
+        fn weekly_reminder_toggle_reflects_the_installed_schedule() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let mut harness = harness(home.path());
+            harness.run();
+            assert!(!harness.state().weekly_report, "a fresh home has no schedule");
+            harness.get_by_label("Weekly reminder");
+            for f in crate::schedule::files(Os::current().expect("os"), home.path()) {
+                std::fs::create_dir_all(f.parent().expect("parent")).expect("mkdir");
+                std::fs::write(&f, b"x").expect("write");
+            }
+            let again = harness_for(home.path());
+            assert!(again.state().weekly_report, "an installed schedule is shown as on");
+        }
+
+        fn harness_for(home: &Path) -> Harness<'static, DiskdustApp> {
+            let mut h = harness(home);
+            h.run();
+            h
+        }
+
+        #[test]
+        fn history_offers_undo_for_the_last_trash_clean() {
+            use diskdust_core::audit::AuditEntry;
+            let home = tempfile::tempdir().expect("tempdir");
+            let os = Os::current().expect("os");
+            let log = crate::session::default_audit_log(os, home.path());
+            for (run, path, mode) in [("r1", "/x/old", DeleteMode::Trash), ("r2", "/x/new", DeleteMode::Trash)] {
+                log.append(&AuditEntry {
+                    timestamp: AuditEntry::now(),
+                    run_id: run.into(),
+                    finding_id: path.into(),
+                    title: path.into(),
+                    path: Some(path.into()),
+                    bytes: Some(10),
+                    action: diskdust_core::model::CleanupAction::RemovePath { path: path.into(), root: "/x".into() },
+                    mode,
+                    elevated: false,
+                    ok: true,
+                    message: "Moved to Trash".into(),
+                })
+                .expect("append");
+            }
+            let mut harness = harness(home.path());
+            harness.state_mut().open_history();
+            harness.run();
+            harness.get_by_label("The last clean moved 1 item to the Trash.");
+            match os {
+                Os::Linux => harness.get_by_label("Undo: put them back"),
+                Os::MacOs => harness.get_by_label("Open Trash"),
+            };
+            save(&mut harness, "history");
         }
 
         #[test]
@@ -1927,7 +2140,7 @@ mod tests {
             let code = home.path().join("code");
             std::fs::create_dir_all(&code).expect("mkdir");
             let mut harness = harness(home.path());
-            harness.state_mut().project_roots = vec![code];
+            harness.state_mut().scope.project_roots = vec![code];
             harness.state_mut().log(true, "Go build cache — Done".to_owned());
             harness.state_mut().log(false, "Stale — permission denied".to_owned());
             harness.run();
@@ -1936,7 +2149,7 @@ mod tests {
             harness.get_by_label_contains("permission denied");
             harness.get_by_label(ICON_REMOVE).click();
             harness.run();
-            assert!(harness.state().project_roots.is_empty());
+            assert!(harness.state().scope.project_roots.is_empty());
             save(&mut harness, "activity");
         }
 
@@ -1966,7 +2179,9 @@ mod tests {
             harness.run();
             harness.get_by_label("Delete 3 items permanently").click();
             wait_until_idle(&mut harness);
-            assert_eq!(harness.state().status, "Cleaned 3 items, freed 3.0 kB");
+            let status = &harness.state().status;
+            assert!(status.starts_with("Cleaned 3 items, freed 3.0 kB"), "{status}");
+            assert!(status.contains("(measured)"), "free-space change is measured: {status}");
             assert_eq!(std::fs::read_dir(&root).expect("read").count(), 0);
         }
 
@@ -1995,7 +2210,9 @@ mod tests {
             assert!(!target.exists(), "selected item must be removed");
             assert!(home_path.join("cache").exists(), "its parent must remain");
             assert!(harness.state().findings.is_empty());
-            assert_eq!(harness.state().status, "Cleaned 1 item, freed 4.1 kB");
+            let status = &harness.state().status;
+            assert!(status.starts_with("Cleaned 1 item, freed 4.1 kB"), "{status}");
+            assert!(status.contains("(measured)"), "free-space change is measured: {status}");
             // Same resolution as the worker, so the test also passes when XDG_STATE_HOME is set.
             let log = diskdust_core::audit::AuditLog::default_location(
                 &home_path,

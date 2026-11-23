@@ -8,18 +8,31 @@ use std::sync::atomic::AtomicBool;
 use anyhow::{Context as _, bail};
 use diskdust_core::clean::DeleteMode;
 use diskdust_core::command::SystemRunner;
+use diskdust_core::disk;
 use diskdust_core::model::{Category, Finding, Os, Privilege, Risk};
+use diskdust_core::restore::{Restored, SystemTrashStore, last_trash_run, restore, trashed_in_run};
 use diskdust_core::scan::{ScanEvent, run_scan};
-use diskdust_core::scanners::{ScanContext, default_app_dirs, default_project_roots, default_scanners, unique_dirs};
+use diskdust_core::scanners::{
+    ScanContext, ScanOptions, default_app_dirs, default_project_roots, scanners_for, unique_dirs,
+};
 
 use crate::format;
+use crate::schedule;
 use crate::session::{CleanResult, Elevation, clean_findings, default_audit_log};
 use crate::settings::{Loaded, Settings, SettingsStore};
+use diskdust_core::command::CommandRunner;
 
 pub const USAGE: &str = "usage:
   diskdust                       open the desktop app
   diskdust scan  [filters] [--json]
                                  print a read-only report
+  diskdust report [--notify] [--min-gb N]
+                                 read-only summary; --notify shows a desktop notification when
+                                 at least N GB (default 5) can be freed
+  diskdust schedule (install | remove | status)
+                                 run `report --notify` weekly (Monday 10:00); never cleans
+  diskdust undo  [--dry-run]     put back what the last Trash-mode clean moved to the Trash
+                                 (Linux; on macOS it lists the items to drag back from the Trash)
   diskdust clean [filters] (--dry-run | --yes) [--include-review] [--permanent] [--json]
                                  clean matching items (moved to the Trash unless --permanent);
                                  Safe items only unless --include-review; the Trash is emptied
@@ -31,7 +44,9 @@ filters:
                         installers, app-caches, logs, xcode, device-backups, orphaned-app-data,
                         trash, system
   --safe-only           only items marked Safe
-  --older-than <days>   only items untouched for at least this many days (e.g. 30 or 30d)";
+  --older-than <days>   only items untouched for at least this many days (e.g. 30 or 30d)
+  --large-files         also search your home folder for large files (cleaned only with
+                        --category large-files)";
 
 /// How `clean` was confirmed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +59,8 @@ pub enum Confirm {
 
 /// Parsed command-line options shared by `scan` and `clean`.
 #[derive(Debug, PartialEq, Eq)]
+// Independent on/off command-line switches; grouping them would not make them less independent.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Options {
     pub json: bool,
     pub categories: Vec<Category>,
@@ -53,6 +70,8 @@ pub struct Options {
     pub mode: DeleteMode,
     /// `clean` also takes items marked Review (they may hold data you want).
     pub include_review: bool,
+    /// Also search the home folder for large files (in addition to the saved setting).
+    pub large_files: bool,
 }
 
 impl Default for Options {
@@ -65,6 +84,7 @@ impl Default for Options {
             confirm: None,
             mode: DeleteMode::Trash,
             include_review: false,
+            large_files: false,
         }
     }
 }
@@ -88,6 +108,7 @@ pub fn parse(args: &[String]) -> anyhow::Result<Options> {
             "--yes" | "-y" => set_confirm(&mut opts, Confirm::Yes)?,
             "--permanent" => opts.mode = DeleteMode::Permanent,
             "--include-review" => opts.include_review = true,
+            "--large-files" => opts.large_files = true,
             "--category" => {
                 let value = it.next().context("--category needs a value")?;
                 let category = Category::from_slug(value).with_context(|| format!("unknown category `{value}`"))?;
@@ -113,11 +134,15 @@ pub fn parse(args: &[String]) -> anyhow::Result<Options> {
 pub enum HeldBack {
     /// Marked Review and `--include-review` was not given.
     Review,
-    /// Emptying the Trash is permanent; it needs `--category trash`.
-    Trash,
+    /// Must be asked for by name with `--category`: the Trash (emptying it is permanent) and
+    /// large files (personal files).
+    NeedsCategory(Category),
     /// Needs the administrator password, which only the desktop app can ask for.
     Admin,
 }
+
+/// Categories `clean` only touches when named with `--category`.
+const EXPLICIT_CATEGORIES: [Category; 2] = [Category::Trash, Category::LargeFiles];
 
 impl Options {
     /// Extra conditions `clean` applies on top of [`Self::matches`]: Review items need
@@ -125,8 +150,8 @@ impl Options {
     pub fn held_back(&self, f: &Finding) -> Option<HeldBack> {
         if f.privilege == Privilege::Admin {
             Some(HeldBack::Admin)
-        } else if f.category == Category::Trash && !self.categories.contains(&Category::Trash) {
-            Some(HeldBack::Trash)
+        } else if EXPLICIT_CATEGORIES.contains(&f.category) && !self.categories.contains(&f.category) {
+            Some(HeldBack::NeedsCategory(f.category))
         } else if f.risk == Risk::Review && !self.include_review {
             Some(HeldBack::Review)
         } else {
@@ -155,7 +180,7 @@ impl Options {
     }
 }
 
-fn scan_machine(settings: &Settings) -> anyhow::Result<(Os, PathBuf, Vec<Finding>)> {
+fn scan_machine(settings: &Settings, large_files: bool) -> anyhow::Result<(Os, PathBuf, Vec<Finding>)> {
     let os = Os::current().context("diskdust supports macOS and Linux only")?;
     let home = dirs::home_dir().context("cannot determine your home directory")?;
     let runner = SystemRunner::new(&home);
@@ -174,7 +199,9 @@ fn scan_machine(settings: &Settings) -> anyhow::Result<(Os, PathBuf, Vec<Finding
             eprintln!("warning: {name}: {error}");
         }
     };
-    let findings = run_scan(&ctx, &default_scanners(), &emit);
+    let options =
+        ScanOptions { large_files: large_files || settings.large_files, custom_rules: settings.custom_rules.clone() };
+    let findings = run_scan(&ctx, &scanners_for(&options), &emit);
     let findings = findings.into_iter().filter(|f| !settings.ignored.contains(&f.id)).collect();
     Ok((os, home, findings))
 }
@@ -194,7 +221,7 @@ pub fn scan(args: &[String]) -> anyhow::Result<()> {
         eprintln!("warning: {problem}; using defaults for those settings");
     }
     let settings = loaded.settings;
-    let (_, home, findings) = scan_machine(&settings)?;
+    let (_, home, findings) = scan_machine(&settings, opts.large_files)?;
     let now = format::now_unix();
     let findings: Vec<Finding> = findings.into_iter().filter(|f| opts.matches(f, now)).collect();
     if opts.json {
@@ -211,7 +238,7 @@ pub fn clean(args: &[String]) -> anyhow::Result<()> {
         bail!("pass --dry-run to preview or --yes to clean\n\n{USAGE}");
     };
     let settings = settings_for_clean(SettingsStore::default_location().load())?;
-    let (os, home, findings) = scan_machine(&settings)?;
+    let (os, home, findings) = scan_machine(&settings, opts.large_files)?;
     let now = format::now_unix();
     let (chosen, held) = opts.select_for_clean(findings, now);
     if !opts.json && !held.is_empty() {
@@ -228,6 +255,7 @@ pub fn clean(args: &[String]) -> anyhow::Result<()> {
     }
     let audit = default_audit_log(os, &home);
     let mut results = Vec::new();
+    let before = disk::space(&home);
     clean_findings(os, &home, &chosen, opts.mode, &audit, Elevation::Skip, &mut |r| {
         if !opts.json {
             println!("{} {} — {}", if r.ok { "ok  " } else { "FAIL" }, r.title, r.message);
@@ -237,11 +265,159 @@ pub fn clean(args: &[String]) -> anyhow::Result<()> {
     if opts.json {
         println!("{}", serde_json::to_string_pretty(&results)?);
     } else {
-        println!("\n{}", summary(&results));
+        println!("\n{}", summary(&results, disk::gained(before, disk::space(&home))));
     }
     let failed = results.iter().filter(|r| !r.ok).count();
     if failed > 0 {
         bail!("{} not cleaned (see above; log: {})", format::items(failed), audit.path().display());
+    }
+    Ok(())
+}
+
+/// Default notification threshold of `report --notify`.
+const REPORT_MIN_GB: u64 = 5;
+
+/// One-line summary of what can be freed, and the total in bytes.
+fn report_summary(findings: &[Finding]) -> (u64, String) {
+    let actionable = findings.iter().filter(|f| f.is_actionable());
+    let (mut total, mut safe) = (0u64, 0u64);
+    for f in actionable {
+        total += f.bytes_or_zero();
+        if f.risk == Risk::Safe {
+            safe += f.bytes_or_zero();
+        }
+    }
+    let text = format!(
+        "{} can be freed ({} marked Safe). Open diskdust to review.",
+        format::bytes(total),
+        format::bytes(safe)
+    );
+    (total, text)
+}
+
+/// `AppleScript` string literal.
+fn applescript_string(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Shows a desktop notification; `false` when no notifier is available.
+fn notify(os: Os, runner: &dyn CommandRunner, text: &str) -> bool {
+    let argv: Vec<String> = match os {
+        Os::MacOs => vec![
+            "osascript".into(),
+            "-e".into(),
+            format!("display notification {} with title \"diskdust\"", applescript_string(text)),
+        ],
+        Os::Linux if runner.exists("notify-send") => vec!["notify-send".into(), "diskdust".into(), text.into()],
+        Os::Linux => return false,
+    };
+    runner.run(&argv, std::time::Duration::from_secs(10)).is_ok_and(|o| o.success)
+}
+
+/// `diskdust report [--notify] [--min-gb N]`: read-only summary for the weekly schedule.
+pub fn report(args: &[String]) -> anyhow::Result<()> {
+    let mut notify_flag = false;
+    let mut min_gb = REPORT_MIN_GB;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--notify" => notify_flag = true,
+            "--min-gb" => {
+                let v = it.next().context("--min-gb needs a number")?;
+                min_gb = v.parse().with_context(|| format!("invalid number `{v}`"))?;
+            }
+            other => bail!("unknown option `{other}`\n\n{USAGE}"),
+        }
+    }
+    let loaded = SettingsStore::default_location().load();
+    let (os, home, findings) = scan_machine(&loaded.settings, false)?;
+    let (total, text) = report_summary(&findings);
+    println!("{text}");
+    if notify_flag && total >= min_gb.saturating_mul(1_000_000_000) {
+        let runner = SystemRunner::new(&home);
+        if !notify(os, &runner, &text) {
+            eprintln!("warning: could not show a notification");
+        }
+    }
+    Ok(())
+}
+
+/// `diskdust schedule (install | remove | status)`.
+pub fn schedule(args: &[String]) -> anyhow::Result<()> {
+    let os = Os::current().context("diskdust supports macOS and Linux only")?;
+    let home = dirs::home_dir().context("cannot determine your home directory")?;
+    let runner = SystemRunner::new(&home);
+    match args {
+        [cmd] if cmd == "install" => {
+            let exe = std::env::current_exe().context("cannot locate the diskdust executable")?;
+            schedule::install(os, &home, &exe, &runner).map_err(anyhow::Error::msg)?;
+            println!("weekly report installed (Monday 10:00): {}", schedule::files(os, &home)[0].display());
+        }
+        [cmd] if cmd == "remove" => {
+            schedule::remove(os, &home, &runner).map_err(anyhow::Error::msg)?;
+            println!("weekly report removed");
+        }
+        [cmd] if cmd == "status" => {
+            let state = if schedule::is_installed(os, &home) { "installed" } else { "not installed" };
+            println!("weekly report: {state}");
+        }
+        _ => bail!("usage: diskdust schedule (install | remove | status)"),
+    }
+    Ok(())
+}
+
+/// Audit entries read when looking for the last clean to undo.
+const UNDO_LOOKBACK: usize = 5_000;
+
+/// `diskdust undo [--dry-run]`: restores what the most recent Trash-mode clean moved to the Trash.
+pub fn undo(args: &[String]) -> anyhow::Result<()> {
+    let dry_run = match args {
+        [] => false,
+        [flag] if flag == "--dry-run" => true,
+        _ => bail!("usage: diskdust undo [--dry-run]"),
+    };
+    let os = Os::current().context("diskdust supports macOS and Linux only")?;
+    let home = dirs::home_dir().context("cannot determine your home directory")?;
+    let log = default_audit_log(os, &home);
+    let entries = log.read_recent(UNDO_LOOKBACK).with_context(|| format!("cannot read {}", log.path().display()))?;
+    let Some(run) = last_trash_run(&entries) else {
+        println!("nothing to undo: no clean has moved anything to the Trash");
+        return Ok(());
+    };
+    let items = trashed_in_run(&entries, &run);
+    if dry_run {
+        println!("the last clean moved {} to the Trash:", format::items(items.len()));
+        for item in &items {
+            println!("  {}", item.path.display());
+        }
+        println!("dry run: nothing was restored");
+        return Ok(());
+    }
+    let outcomes = match restore(&items, &SystemTrashStore) {
+        Ok(outcomes) => outcomes,
+        Err(hint) => {
+            println!("the last clean moved {} to the Trash:", format::items(items.len()));
+            for item in &items {
+                println!("  {}", item.path.display());
+            }
+            bail!("{hint}");
+        }
+    };
+    let mut not_restored = 0;
+    for (item, outcome) in &outcomes {
+        let text = match outcome {
+            Restored::Restored => "restored",
+            Restored::NotInTrash => "not in the Trash any more (already restored, or the Trash was emptied)",
+            Restored::PathExists => "left in the Trash: something exists at that path again",
+            Restored::Failed(e) => e.as_str(),
+        };
+        if *outcome != Restored::Restored {
+            not_restored += 1;
+        }
+        println!("{} {} — {text}", if *outcome == Restored::Restored { "ok  " } else { "skip" }, item.path.display());
+    }
+    if not_restored > 0 {
+        bail!("{} not restored", format::items(not_restored));
     }
     Ok(())
 }
@@ -254,7 +430,8 @@ fn needs(n: usize) -> String {
 /// Explains which matching items `clean` left out and how to include them.
 fn held_back_note(held: &[(Finding, HeldBack)]) -> String {
     let review = held.iter().filter(|(_, r)| *r == HeldBack::Review).count();
-    let trash = held.iter().any(|(_, r)| *r == HeldBack::Trash);
+    let trash = held.iter().any(|(_, r)| *r == HeldBack::NeedsCategory(Category::Trash));
+    let large = held.iter().filter(|(_, r)| *r == HeldBack::NeedsCategory(Category::LargeFiles)).count();
     let admin = held.iter().filter(|(_, r)| *r == HeldBack::Admin).count();
     let mut parts = Vec::new();
     if review > 0 {
@@ -263,13 +440,17 @@ fn held_back_note(held: &[(Finding, HeldBack)]) -> String {
     if trash {
         parts.push("the Trash is not emptied (add --category trash)".to_owned());
     }
+    if large > 0 {
+        let what = if large == 1 { "1 large file is".to_owned() } else { format!("{large} large files are") };
+        parts.push(format!("{what} not included (add --category large-files)"));
+    }
     if admin > 0 {
         parts.push(format!("{} administrator access (clean from the desktop app)", needs(admin)));
     }
     format!("not included: {}", parts.join("; "))
 }
 
-fn summary(results: &[CleanResult]) -> String {
+fn summary(results: &[CleanResult], disk_gain: Option<i64>) -> String {
     let ok: Vec<&CleanResult> = results.iter().filter(|r| r.ok).collect();
     let freed: u64 = ok.iter().filter(|r| !r.trashed).filter_map(|r| r.bytes).sum();
     let trashed: u64 = ok.iter().filter(|r| r.trashed).filter_map(|r| r.bytes).sum();
@@ -280,6 +461,9 @@ fn summary(results: &[CleanResult]) -> String {
     let failed = results.len() - ok.len();
     if failed > 0 {
         let _ = write!(out, ", {failed} not cleaned");
+    }
+    if let Some(gain) = disk_gain {
+        let _ = write!(out, "; free space {} (measured)", format::signed_bytes(gain));
     }
     out
 }
@@ -366,6 +550,7 @@ mod tests {
                 confirm: Some(Confirm::Yes),
                 mode: DeleteMode::Permanent,
                 include_review: true,
+                large_files: false,
             }
         );
         assert_eq!(parse(&args(&["--dry-run", "--dry-run"])).expect("parse").confirm, Some(Confirm::DryRun));
@@ -405,8 +590,12 @@ mod tests {
             trashed,
         };
         assert_eq!(
-            summary(&[r(true, 2_000_000, false), r(true, 3_000_000, true), r(false, 1, false)]),
+            summary(&[r(true, 2_000_000, false), r(true, 3_000_000, true), r(false, 1, false)], None),
             "cleaned 2 items, freed 2.0 MB, 3.0 MB moved to the Trash (empty it to reclaim), 1 not cleaned"
+        );
+        assert_eq!(
+            summary(&[r(true, 2_000_000, false)], Some(1_900_000)),
+            "cleaned 1 item, freed 2.0 MB; free space +1.9 MB (measured)"
         );
         assert!(USAGE.contains("--dry-run"));
     }
@@ -447,7 +636,7 @@ mod tests {
         let (chosen, held) = opts.select_for_clean(all.clone(), 0);
         assert_eq!(chosen.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["cache"]);
         let reasons: Vec<_> = held.iter().map(|(f, r)| (f.id.as_str(), *r)).collect();
-        assert_eq!(reasons, [("volumes", HeldBack::Review), ("trash", HeldBack::Trash)]);
+        assert_eq!(reasons, [("volumes", HeldBack::Review), ("trash", HeldBack::NeedsCategory(Category::Trash))]);
         assert_eq!(
             held_back_note(&held),
             "not included: 1 item is marked Review (add --include-review); the Trash is not emptied (add --category trash)"
@@ -483,5 +672,30 @@ mod tests {
             held_back_note(&held),
             "not included: 1 item needs administrator access (clean from the desktop app)"
         );
+    }
+
+    #[test]
+    fn large_files_need_their_category_even_with_include_review() {
+        let movie = categorized("movie", Category::LargeFiles, Risk::Review);
+        let opts = parse(&args(&["--yes", "--include-review", "--large-files"])).expect("parse");
+        assert!(opts.large_files);
+        let (chosen, held) = opts.select_for_clean(vec![movie.clone()], 0);
+        assert!(chosen.is_empty());
+        assert_eq!(held_back_note(&held), "not included: 1 large file is not included (add --category large-files)");
+        let opts = parse(&args(&["--yes", "--include-review", "--category", "large-files"])).expect("parse");
+        assert_eq!(opts.select_for_clean(vec![movie], 0).0.len(), 1);
+    }
+
+    #[test]
+    fn report_summary_counts_actionable_items() {
+        let mut review = categorized("vol", Category::Containers, Risk::Review);
+        review.bytes = Some(3_000_000_000);
+        let mut safe = categorized("cache", Category::DeveloperCaches, Risk::Safe);
+        safe.bytes = Some(2_000_000_000);
+        let info = finding("raw", Some(64_000_000_000), false, Privilege::User);
+        let (total, text) = report_summary(&[review, safe, info]);
+        assert_eq!(total, 5_000_000_000);
+        assert_eq!(text, "5.0 GB can be freed (2.0 GB marked Safe). Open diskdust to review.");
+        assert_eq!(applescript_string(r#"a "b" \c"#), r#""a \"b\" \\c""#);
     }
 }

@@ -18,9 +18,27 @@ pub fn space(path: &Path) -> Option<DiskSpace> {
     Some(DiskSpace { available: stat.f_bavail.saturating_mul(block), total: stat.f_blocks.saturating_mul(block) })
 }
 
+/// Change in available space between two measurements: positive when space was freed. `None`
+/// when either measurement failed. Other programs writing at the same time also affect it, so it
+/// is reported as a measurement, not as what the clean alone freed.
+pub fn gained(before: Option<DiskSpace>, after: Option<DiskSpace>) -> Option<i64> {
+    let (before, after) = (before?, after?);
+    let delta = i128::from(after.available) - i128::from(before.available);
+    Some(i64::try_from(delta).unwrap_or(if delta < 0 { i64::MIN } else { i64::MAX }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gain_is_the_change_in_available_space() {
+        let at = |available| Some(DiskSpace { available, total: 100 });
+        assert_eq!(gained(at(10), at(35)), Some(25));
+        assert_eq!(gained(at(35), at(10)), Some(-25));
+        assert_eq!(gained(None, at(10)), None);
+        assert_eq!(gained(at(0), at(u64::MAX)), Some(i64::MAX), "saturates");
+    }
 
     #[test]
     fn reports_space_of_existing_paths_only() {
