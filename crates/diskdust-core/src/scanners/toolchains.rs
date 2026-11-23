@@ -358,6 +358,8 @@ fn jetbrains(ctx: &ScanContext<'_>) -> Vec<Finding> {
             versions.pop(); // keep the newest version of each IDE
             versions
         })
+        // Scratch files are the user's own writing; never offer a folder that still holds some.
+        .filter(|(_, path)| children(&path.join("scratches")).is_empty())
         .filter_map(|(_, path)| {
             let name = file_name(&path);
             finding(
@@ -366,8 +368,8 @@ fn jetbrains(ctx: &ScanContext<'_>) -> Vec<Finding> {
                 format!("{name} settings"),
                 &path,
                 CleanupAction::RemovePath { path: path.clone(), root: base.clone() },
-                "Settings, plugins and local history of an older JetBrains IDE version. Newer versions import \
-                 them on upgrade.",
+                "Settings and plugins of an older JetBrains IDE version. Newer versions import them on \
+                 upgrade. Folders that still contain scratch files are never offered.",
             )
         })
         .collect()
@@ -596,6 +598,20 @@ mod tests {
         let runner = FakeRunner::new();
         let found = ToolchainsScanner.scan(&env.ctx(Os::MacOs, &runner)).expect("scan");
         assert_eq!(titles(&found), ["GoLand2023.1 settings", "GoLand2024.3 settings"]);
+    }
+
+    #[test]
+    fn jetbrains_folders_with_scratch_files_are_never_offered() {
+        let env = Env::new();
+        for d in ["GoLand2023.1", "GoLand2024.3", "GoLand2025.2"] {
+            env.file(&format!("Library/Application Support/JetBrains/{d}/options/x.xml"), BIG);
+        }
+        env.file("Library/Application Support/JetBrains/GoLand2023.1/scratches/notes.sql", 100);
+        std::fs::create_dir_all(env.home.join("Library/Application Support/JetBrains/GoLand2024.3/scratches"))
+            .expect("empty scratches dir");
+        let runner = FakeRunner::new();
+        let found = ToolchainsScanner.scan(&env.ctx(Os::MacOs, &runner)).expect("scan");
+        assert_eq!(titles(&found), ["GoLand2024.3 settings"], "an empty scratches folder does not block");
     }
 
     #[test]
