@@ -309,7 +309,7 @@ fn render_table(findings: &[Finding], home: &Path) -> String {
         );
     }
     let total: u64 = findings.iter().filter(|f| f.is_actionable()).map(Finding::bytes_or_zero).sum();
-    let _ = writeln!(out, "\n{} items, {} reclaimable", findings.len(), format::bytes(total));
+    let _ = writeln!(out, "\n{}, {} reclaimable", format::items(findings.len()), format::bytes(total));
     out
 }
 
