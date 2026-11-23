@@ -17,13 +17,20 @@ use diskdust_core::scanners::{
 };
 
 use crate::format;
+use crate::schedule;
 use crate::session::{CleanResult, Elevation, clean_findings, default_audit_log};
 use crate::settings::{Loaded, Settings, SettingsStore};
+use diskdust_core::command::CommandRunner;
 
 pub const USAGE: &str = "usage:
   diskdust                       open the desktop app
   diskdust scan  [filters] [--json]
                                  print a read-only report
+  diskdust report [--notify] [--min-gb N]
+                                 read-only summary; --notify shows a desktop notification when
+                                 at least N GB (default 5) can be freed
+  diskdust schedule (install | remove | status)
+                                 run `report --notify` weekly (Monday 10:00); never cleans
   diskdust undo  [--dry-run]     put back what the last Trash-mode clean moved to the Trash
                                  (Linux; on macOS it lists the items to drag back from the Trash)
   diskdust clean [filters] (--dry-run | --yes) [--include-review] [--permanent] [--json]
@@ -263,6 +270,98 @@ pub fn clean(args: &[String]) -> anyhow::Result<()> {
     let failed = results.iter().filter(|r| !r.ok).count();
     if failed > 0 {
         bail!("{} not cleaned (see above; log: {})", format::items(failed), audit.path().display());
+    }
+    Ok(())
+}
+
+/// Default notification threshold of `report --notify`.
+const REPORT_MIN_GB: u64 = 5;
+
+/// One-line summary of what can be freed, and the total in bytes.
+fn report_summary(findings: &[Finding]) -> (u64, String) {
+    let actionable = findings.iter().filter(|f| f.is_actionable());
+    let (mut total, mut safe) = (0u64, 0u64);
+    for f in actionable {
+        total += f.bytes_or_zero();
+        if f.risk == Risk::Safe {
+            safe += f.bytes_or_zero();
+        }
+    }
+    let text = format!(
+        "{} can be freed ({} marked Safe). Open diskdust to review.",
+        format::bytes(total),
+        format::bytes(safe)
+    );
+    (total, text)
+}
+
+/// `AppleScript` string literal.
+fn applescript_string(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Shows a desktop notification; `false` when no notifier is available.
+fn notify(os: Os, runner: &dyn CommandRunner, text: &str) -> bool {
+    let argv: Vec<String> = match os {
+        Os::MacOs => vec![
+            "osascript".into(),
+            "-e".into(),
+            format!("display notification {} with title \"diskdust\"", applescript_string(text)),
+        ],
+        Os::Linux if runner.exists("notify-send") => vec!["notify-send".into(), "diskdust".into(), text.into()],
+        Os::Linux => return false,
+    };
+    runner.run(&argv, std::time::Duration::from_secs(10)).is_ok_and(|o| o.success)
+}
+
+/// `diskdust report [--notify] [--min-gb N]`: read-only summary for the weekly schedule.
+pub fn report(args: &[String]) -> anyhow::Result<()> {
+    let mut notify_flag = false;
+    let mut min_gb = REPORT_MIN_GB;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--notify" => notify_flag = true,
+            "--min-gb" => {
+                let v = it.next().context("--min-gb needs a number")?;
+                min_gb = v.parse().with_context(|| format!("invalid number `{v}`"))?;
+            }
+            other => bail!("unknown option `{other}`\n\n{USAGE}"),
+        }
+    }
+    let loaded = SettingsStore::default_location().load();
+    let (os, home, findings) = scan_machine(&loaded.settings, false)?;
+    let (total, text) = report_summary(&findings);
+    println!("{text}");
+    if notify_flag && total >= min_gb.saturating_mul(1_000_000_000) {
+        let runner = SystemRunner::new(&home);
+        if !notify(os, &runner, &text) {
+            eprintln!("warning: could not show a notification");
+        }
+    }
+    Ok(())
+}
+
+/// `diskdust schedule (install | remove | status)`.
+pub fn schedule(args: &[String]) -> anyhow::Result<()> {
+    let os = Os::current().context("diskdust supports macOS and Linux only")?;
+    let home = dirs::home_dir().context("cannot determine your home directory")?;
+    let runner = SystemRunner::new(&home);
+    match args {
+        [cmd] if cmd == "install" => {
+            let exe = std::env::current_exe().context("cannot locate the diskdust executable")?;
+            schedule::install(os, &home, &exe, &runner).map_err(anyhow::Error::msg)?;
+            println!("weekly report installed (Monday 10:00): {}", schedule::files(os, &home)[0].display());
+        }
+        [cmd] if cmd == "remove" => {
+            schedule::remove(os, &home, &runner).map_err(anyhow::Error::msg)?;
+            println!("weekly report removed");
+        }
+        [cmd] if cmd == "status" => {
+            let state = if schedule::is_installed(os, &home) { "installed" } else { "not installed" };
+            println!("weekly report: {state}");
+        }
+        _ => bail!("usage: diskdust schedule (install | remove | status)"),
     }
     Ok(())
 }
@@ -585,5 +684,18 @@ mod tests {
         assert_eq!(held_back_note(&held), "not included: 1 large file is not included (add --category large-files)");
         let opts = parse(&args(&["--yes", "--include-review", "--category", "large-files"])).expect("parse");
         assert_eq!(opts.select_for_clean(vec![movie], 0).0.len(), 1);
+    }
+
+    #[test]
+    fn report_summary_counts_actionable_items() {
+        let mut review = categorized("vol", Category::Containers, Risk::Review);
+        review.bytes = Some(3_000_000_000);
+        let mut safe = categorized("cache", Category::DeveloperCaches, Risk::Safe);
+        safe.bytes = Some(2_000_000_000);
+        let info = finding("raw", Some(64_000_000_000), false, Privilege::User);
+        let (total, text) = report_summary(&[review, safe, info]);
+        assert_eq!(total, 5_000_000_000);
+        assert_eq!(text, "5.0 GB can be freed (2.0 GB marked Safe). Open diskdust to review.");
+        assert_eq!(applescript_string(r#"a "b" \c"#), r#""a \"b\" \\c""#);
     }
 }

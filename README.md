@@ -72,6 +72,10 @@ was last modified.
   skipped while the app runs; the confirmation dialog says which apps to quit.
 - **Free space** of your home volume in the toolbar, **Empty Trash** after a Trash-mode clean, and a
   **History** of past cleanups (from the audit log).
+- **Weekly reminder** (sidebar): every Monday at 10:00 a read-only scan runs and notifies you when
+  5 GB or more can be freed. It is a per-user LaunchAgent (`~/Library/LaunchAgents/dev.diskdust.report.plist`)
+  or systemd user timer (`~/.config/systemd/user/diskdust-report.timer`); nothing is ever cleaned
+  automatically.
 - **Undo**: *History* offers to put back what the last Trash-mode clean moved to the Trash (Linux,
   and `diskdust undo`). Nothing is overwritten: an item whose original path exists again stays in
   the Trash. macOS has no API for this, so there *History* lists the items and opens the Trash for
@@ -133,6 +137,8 @@ diskdust                                   # open the desktop app
 diskdust scan [filters] [--json]           # read-only report in the terminal
 diskdust clean [filters] --dry-run         # list what would be cleaned
 diskdust undo [--dry-run]                  # put back what the last Trash-mode clean moved (Linux)
+diskdust report [--notify] [--min-gb N]    # read-only summary, optional desktop notification
+diskdust schedule install|remove|status    # weekly report (Monday 10:00), never cleans
 diskdust clean [filters] --yes [--include-review] [--permanent] [--json]
 ```
 

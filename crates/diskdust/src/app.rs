@@ -110,6 +110,8 @@ pub struct DiskdustApp {
     /// True once the user edited the project folders (then they are persisted).
     /// What a scan searches beyond the built-in locations.
     scope: SearchScope,
+    /// Whether the weekly read-only report is installed (`LaunchAgent` / systemd user timer).
+    weekly_report: bool,
     store: SettingsStore,
     /// Last settings written, to save only on change.
     saved: Settings,
@@ -153,6 +155,7 @@ impl DiskdustApp {
             older_than: saved.older_than,
             ignored: saved.ignored.clone(),
             show_ignored: false,
+            weekly_report: false,
             scope: SearchScope {
                 project_roots,
                 customized: roots_customized,
@@ -180,6 +183,34 @@ impl DiskdustApp {
         .with_disk_space()
         .with_access_probe()
         .with_settings_problem(settings_problem)
+        .with_schedule_state()
+    }
+
+    fn with_schedule_state(mut self) -> Self {
+        self.weekly_report = crate::schedule::is_installed(self.os, &self.home);
+        self
+    }
+
+    /// Installs or removes the weekly report after the sidebar toggle changed.
+    fn apply_weekly_report(&mut self) {
+        let runner = diskdust_core::command::SystemRunner::new(&self.home);
+        let result = if self.weekly_report {
+            std::env::current_exe()
+                .map_err(|e| format!("cannot locate the diskdust executable: {e}"))
+                .and_then(|exe| crate::schedule::install(self.os, &self.home, &exe, &runner))
+        } else {
+            crate::schedule::remove(self.os, &self.home, &runner)
+        };
+        match result {
+            Ok(()) if self.weekly_report => {
+                self.log(true, "Weekly report on: diskdust will check on Mondays at 10:00 and notify you.".into());
+            }
+            Ok(()) => self.log(true, "Weekly report off.".into()),
+            Err(e) => {
+                self.log(false, format!("Could not change the weekly report: {e}"));
+                self.weekly_report = crate::schedule::is_installed(self.os, &self.home);
+            }
+        }
     }
 
     /// Keeps an unreadable settings file safe before anything is saved over it, and says so.
@@ -847,6 +878,16 @@ impl DiskdustApp {
              On macOS this asks for access to Desktop, Pictures, Movies and other folders. Hidden folders, \
              Library and photo or VM libraries are never searched.",
         );
+        if ui
+            .checkbox(&mut self.weekly_report, "Weekly reminder")
+            .on_hover_text(
+                "Every Monday at 10:00, scan (read-only) and show a notification when 5 GB or more can be freed. \
+                 Nothing is cleaned automatically.",
+            )
+            .changed()
+        {
+            self.apply_weekly_report();
+        }
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -1854,6 +1895,27 @@ mod tests {
             let saved = SettingsStore::at(path).load();
             assert_eq!(saved.problem, None, "the new file is valid");
             assert_eq!(saved.settings.older_than, Some(30));
+        }
+
+        #[test]
+        fn weekly_reminder_toggle_reflects_the_installed_schedule() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let mut harness = harness(home.path());
+            harness.run();
+            assert!(!harness.state().weekly_report, "a fresh home has no schedule");
+            harness.get_by_label("Weekly reminder");
+            for f in crate::schedule::files(Os::current().expect("os"), home.path()) {
+                std::fs::create_dir_all(f.parent().expect("parent")).expect("mkdir");
+                std::fs::write(&f, b"x").expect("write");
+            }
+            let again = harness_for(home.path());
+            assert!(again.state().weekly_report, "an installed schedule is shown as on");
+        }
+
+        fn harness_for(home: &Path) -> Harness<'static, DiskdustApp> {
+            let mut h = harness(home);
+            h.run();
+            h
         }
 
         #[test]

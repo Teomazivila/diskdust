@@ -9,6 +9,7 @@
 mod app;
 mod cli;
 mod format;
+mod schedule;
 mod session;
 mod settings;
 mod worker;
@@ -35,6 +36,8 @@ fn main() -> ExitCode {
         Some("scan") => cli::scan(&args[2..]),
         Some("clean") => cli::clean(&args[2..]),
         Some("undo") => cli::undo(&args[2..]),
+        Some("report") => cli::report(&args[2..]),
+        Some("schedule") => cli::schedule(&args[2..]),
         Some("-h" | "--help") => {
             println!("{}", cli::USAGE);
             Ok(())
