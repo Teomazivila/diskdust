@@ -71,6 +71,10 @@ was last modified.
   skipped while the app runs; the confirmation dialog says which apps to quit.
 - **Free space** of your home volume in the toolbar, **Empty Trash** after a Trash-mode clean, and a
   **History** of past cleanups (from the audit log).
+- **Undo**: *History* offers to put back what the last Trash-mode clean moved to the Trash (Linux,
+  and `diskdust undo`). Nothing is overwritten: an item whose original path exists again stays in
+  the Trash. macOS has no API for this, so there *History* lists the items and opens the Trash for
+  you to drag them back.
 - **Your own rules**: add folders no built-in rule knows to `settings.json` (see below).
 - Project folders, delete mode, age filter and ignored items are saved in `settings.json`
   (`~/Library/Application Support/diskdust/` on macOS, `$XDG_CONFIG_HOME/diskdust/` on Linux).
@@ -124,6 +128,7 @@ folder (`~/Documents` itself, `~/.ssh`, …) or a path outside your home is skip
 diskdust                                   # open the desktop app
 diskdust scan [filters] [--json]           # read-only report in the terminal
 diskdust clean [filters] --dry-run         # list what would be cleaned
+diskdust undo [--dry-run]                  # put back what the last Trash-mode clean moved (Linux)
 diskdust clean [filters] --yes [--include-review] [--permanent] [--json]
 ```
 

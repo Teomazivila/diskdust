@@ -13,6 +13,7 @@ pub mod disk;
 pub mod model;
 pub mod mounts;
 pub mod privilege;
+pub mod restore;
 pub mod safety;
 pub mod scan;
 pub mod scanners;

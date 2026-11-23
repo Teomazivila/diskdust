@@ -10,6 +10,7 @@ use diskdust_core::clean::DeleteMode;
 use diskdust_core::command::SystemRunner;
 use diskdust_core::disk;
 use diskdust_core::model::{Category, Finding, Os, Privilege, Risk};
+use diskdust_core::restore::{Restored, SystemTrashStore, last_trash_run, restore, trashed_in_run};
 use diskdust_core::scan::{ScanEvent, run_scan};
 use diskdust_core::scanners::{
     ScanContext, ScanOptions, default_app_dirs, default_project_roots, scanners_for, unique_dirs,
@@ -23,6 +24,8 @@ pub const USAGE: &str = "usage:
   diskdust                       open the desktop app
   diskdust scan  [filters] [--json]
                                  print a read-only report
+  diskdust undo  [--dry-run]     put back what the last Trash-mode clean moved to the Trash
+                                 (Linux; on macOS it lists the items to drag back from the Trash)
   diskdust clean [filters] (--dry-run | --yes) [--include-review] [--permanent] [--json]
                                  clean matching items (moved to the Trash unless --permanent);
                                  Safe items only unless --include-review; the Trash is emptied
@@ -260,6 +263,62 @@ pub fn clean(args: &[String]) -> anyhow::Result<()> {
     let failed = results.iter().filter(|r| !r.ok).count();
     if failed > 0 {
         bail!("{} not cleaned (see above; log: {})", format::items(failed), audit.path().display());
+    }
+    Ok(())
+}
+
+/// Audit entries read when looking for the last clean to undo.
+const UNDO_LOOKBACK: usize = 5_000;
+
+/// `diskdust undo [--dry-run]`: restores what the most recent Trash-mode clean moved to the Trash.
+pub fn undo(args: &[String]) -> anyhow::Result<()> {
+    let dry_run = match args {
+        [] => false,
+        [flag] if flag == "--dry-run" => true,
+        _ => bail!("usage: diskdust undo [--dry-run]"),
+    };
+    let os = Os::current().context("diskdust supports macOS and Linux only")?;
+    let home = dirs::home_dir().context("cannot determine your home directory")?;
+    let log = default_audit_log(os, &home);
+    let entries = log.read_recent(UNDO_LOOKBACK).with_context(|| format!("cannot read {}", log.path().display()))?;
+    let Some(run) = last_trash_run(&entries) else {
+        println!("nothing to undo: no clean has moved anything to the Trash");
+        return Ok(());
+    };
+    let items = trashed_in_run(&entries, &run);
+    if dry_run {
+        println!("the last clean moved {} to the Trash:", format::items(items.len()));
+        for item in &items {
+            println!("  {}", item.path.display());
+        }
+        println!("dry run: nothing was restored");
+        return Ok(());
+    }
+    let outcomes = match restore(&items, &SystemTrashStore) {
+        Ok(outcomes) => outcomes,
+        Err(hint) => {
+            println!("the last clean moved {} to the Trash:", format::items(items.len()));
+            for item in &items {
+                println!("  {}", item.path.display());
+            }
+            bail!("{hint}");
+        }
+    };
+    let mut not_restored = 0;
+    for (item, outcome) in &outcomes {
+        let text = match outcome {
+            Restored::Restored => "restored",
+            Restored::NotInTrash => "not in the Trash any more (already restored, or the Trash was emptied)",
+            Restored::PathExists => "left in the Trash: something exists at that path again",
+            Restored::Failed(e) => e.as_str(),
+        };
+        if *outcome != Restored::Restored {
+            not_restored += 1;
+        }
+        println!("{} {} — {text}", if *outcome == Restored::Restored { "ok  " } else { "skip" }, item.path.display());
+    }
+    if not_restored > 0 {
+        bail!("{} not restored", format::items(not_restored));
     }
     Ok(())
 }

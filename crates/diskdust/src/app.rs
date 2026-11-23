@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use diskdust_core::clean::DeleteMode;
 use diskdust_core::model::{Category, CleanupAction, Finding, Os, Privilege, Risk};
+use diskdust_core::restore::{MACOS_RESTORE_HINT, Restored, Trashed, last_trash_run, trashed_in_run};
 use diskdust_core::scan::ScanEvent;
 use diskdust_core::scanners::{CustomRule, LARGE_FILE_MIN, ScanOptions, default_project_roots, unique_dirs};
 use egui::{Align, Color32, Layout, RichText, Sense, vec2};
@@ -248,6 +249,33 @@ impl DiskdustApp {
         }
     }
 
+    fn on_restored(&mut self, result: Result<Vec<(Trashed, Restored)>, String>) {
+        match result {
+            Err(e) => {
+                self.log(false, e.clone());
+                self.status = e;
+            }
+            Ok(outcomes) => {
+                let restored = outcomes.iter().filter(|(_, o)| *o == Restored::Restored).count();
+                for (item, outcome) in outcomes {
+                    let ok = outcome == Restored::Restored;
+                    let text = match outcome {
+                        Restored::Restored => "restored".to_owned(),
+                        Restored::NotInTrash => {
+                            "not in the Trash any more (already restored, or the Trash was emptied)".to_owned()
+                        }
+                        Restored::PathExists => "left in the Trash: something exists at that path again".to_owned(),
+                        Restored::Failed(e) => e,
+                    };
+                    self.log(ok, format!("{} — {text}", item.path.display()));
+                }
+                self.status =
+                    format!("Restored {} from the Trash. Rescan to update the list.", format::items(restored));
+            }
+        }
+        self.refresh_disk();
+    }
+
     fn start_empty_trash(&mut self) {
         self.offer_empty_trash = false;
         self.tally = CleanTally::default();
@@ -258,7 +286,10 @@ impl DiskdustApp {
 
     fn history_window(&mut self, ctx: &egui::Context) {
         let Some(entries) = &self.history else { return };
+        let os = self.os;
         let mut open = true;
+        let mut undo: Option<Vec<Trashed>> = None;
+        let mut open_trash = false;
         egui::Window::new("Cleanup history")
             .open(&mut open)
             .anchor(egui::Align2::CENTER_TOP, vec2(0.0, 70.0))
@@ -269,6 +300,23 @@ impl DiskdustApp {
                 if entries.is_empty() {
                     ui.label(RichText::new("Nothing has been cleaned yet.").weak());
                     return;
+                }
+                if let Some(run) = last_trash_run(entries) {
+                    let items = trashed_in_run(entries, &run);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(format!("The last clean moved {} to the Trash.", format::items(items.len())));
+                        if os == Os::Linux {
+                            if ui.button("Undo: put them back").clicked() {
+                                undo = Some(items.clone());
+                            }
+                        } else {
+                            if ui.button("Open Trash").clicked() {
+                                open_trash = true;
+                            }
+                            ui.label(RichText::new(MACOS_RESTORE_HINT).weak().small());
+                        }
+                    });
+                    ui.separator();
                 }
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     egui::Grid::new("history-grid").striped(true).num_columns(4).spacing(vec2(12.0, 4.0)).show(
@@ -291,6 +339,16 @@ impl DiskdustApp {
             });
         if !open {
             self.history = None;
+        }
+        if let Some(items) = undo {
+            self.status = format!("Restoring {} from the Trash…", format::items(items.len()));
+            worker::spawn_restore(items, self.notifier.clone());
+        }
+        if open_trash {
+            let trash = self.home.join(".Trash");
+            if let Err(e) = opener::open(&trash) {
+                self.log(false, format!("Could not open the Trash: {e}"));
+            }
         }
     }
 
@@ -568,6 +626,7 @@ impl DiskdustApp {
                         self.breakdown = Breakdown::Ready(id, entries);
                     }
                 }
+                Msg::Restored(result) => self.on_restored(result),
                 Msg::CleanDone { disk_gain } => {
                     self.tally.disk_gain = disk_gain;
                     self.status = clean_summary(&self.tally);
@@ -1786,6 +1845,39 @@ mod tests {
             let saved = SettingsStore::at(path).load();
             assert_eq!(saved.problem, None, "the new file is valid");
             assert_eq!(saved.settings.older_than, Some(30));
+        }
+
+        #[test]
+        fn history_offers_undo_for_the_last_trash_clean() {
+            use diskdust_core::audit::AuditEntry;
+            let home = tempfile::tempdir().expect("tempdir");
+            let os = Os::current().expect("os");
+            let log = crate::session::default_audit_log(os, home.path());
+            for (run, path, mode) in [("r1", "/x/old", DeleteMode::Trash), ("r2", "/x/new", DeleteMode::Trash)] {
+                log.append(&AuditEntry {
+                    timestamp: AuditEntry::now(),
+                    run_id: run.into(),
+                    finding_id: path.into(),
+                    title: path.into(),
+                    path: Some(path.into()),
+                    bytes: Some(10),
+                    action: diskdust_core::model::CleanupAction::RemovePath { path: path.into(), root: "/x".into() },
+                    mode,
+                    elevated: false,
+                    ok: true,
+                    message: "Moved to Trash".into(),
+                })
+                .expect("append");
+            }
+            let mut harness = harness(home.path());
+            harness.state_mut().open_history();
+            harness.run();
+            harness.get_by_label("The last clean moved 1 item to the Trash.");
+            match os {
+                Os::Linux => harness.get_by_label("Undo: put them back"),
+                Os::MacOs => harness.get_by_label("Open Trash"),
+            };
+            save(&mut harness, "history");
         }
 
         #[test]

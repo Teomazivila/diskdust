@@ -11,6 +11,7 @@ use diskdust_core::clean::DeleteMode;
 use diskdust_core::command::SystemRunner;
 use diskdust_core::disk;
 use diskdust_core::model::{Finding, Os};
+use diskdust_core::restore::{Restored, SystemTrashStore, Trashed, restore};
 use diskdust_core::scan::{ScanEvent, run_scan};
 use diskdust_core::scanners::{ScanContext, ScanOptions, Scanner, TrashScanner, default_app_dirs, scanners_for};
 
@@ -27,6 +28,8 @@ pub enum Msg {
         cancelled: bool,
     },
     Cleaned(CleanResult),
+    /// Restoring the last clean finished: each item's outcome, or why the Trash could not be used.
+    Restored(Result<Vec<(Trashed, Restored)>, String>),
     /// A clean finished; `disk_gain` is the measured change in free space of the home volume.
     CleanDone {
         disk_gain: Option<i64>,
@@ -89,6 +92,16 @@ pub fn spawn_scan(
     });
     if let Err(e) = spawned {
         tracing::error!(error = %e, "failed to start scan thread");
+    }
+}
+
+/// Restores `items` from the Trash on a background thread.
+pub fn spawn_restore(items: Vec<Trashed>, notifier: Notifier) {
+    let spawned = thread::Builder::new().name("diskdust-restore".into()).spawn(move || {
+        notifier.send(Msg::Restored(restore(&items, &SystemTrashStore)));
+    });
+    if let Err(e) = spawned {
+        tracing::error!(error = %e, "failed to start restore thread");
     }
 }
 
