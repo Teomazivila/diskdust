@@ -29,6 +29,16 @@ pub fn parse_docker_reclaimed(line: &str) -> Option<u64> {
     parse_docker_size(rest.trim())
 }
 
+/// Homebrew's own estimate from `brew cleanup --dry-run`: the line
+/// `==> This operation would free approximately 2.2GB of disk space.` Homebrew formats sizes in
+/// decimal units (`B`, `KB`, `MB`, `GB`), the same convention [`parse_docker_size`] reads.
+pub fn parse_brew_estimate(output: &str) -> Option<u64> {
+    output.lines().find_map(|line| {
+        let rest = line.split_once("would free approximately ")?.1;
+        parse_docker_size(rest.split_whitespace().next()?)
+    })
+}
+
 /// Parses the output of `journalctl --disk-usage`, e.g.
 /// `"Archived and active journals take up 1.2G in the file system."`.
 ///
@@ -115,6 +125,23 @@ mod tests {
         assert_eq!(parse_docker_reclaimed("  Total reclaimed space: 0B\n"), Some(0));
         assert_eq!(parse_docker_reclaimed("Deleted Images:"), None);
         assert_eq!(parse_docker_reclaimed("Total: lots"), None);
+    }
+
+    #[test]
+    fn brew_estimate_from_real_dry_run() {
+        let out = "Would remove: /opt/homebrew/Library/Homebrew/vendor/portable-ruby/4.0.7 (1,707 files, 34.6MB)\n\
+                   ==> This operation would free approximately 2.2GB of disk space.\n";
+        assert_eq!(parse_brew_estimate(out), Some(2_200_000_000));
+        assert_eq!(
+            parse_brew_estimate("==> This operation would free approximately 512KB of disk space."),
+            Some(512_000)
+        );
+        assert_eq!(
+            parse_brew_estimate("==> This operation would free approximately 3MB of disk space."),
+            Some(3_000_000)
+        );
+        assert_eq!(parse_brew_estimate(""), None);
+        assert_eq!(parse_brew_estimate("would free approximately lots"), None);
     }
 
     #[test]

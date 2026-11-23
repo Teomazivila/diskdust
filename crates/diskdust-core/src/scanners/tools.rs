@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 
 use super::{MIN_BYTES, ScanContext, ScanError, Scanner, base_finding, is_real_dir, with_shared_note};
 use crate::model::{Category, CleanupAction, Finding, KnownCommand, Os, Privilege, Risk, SPECIFIC};
-use crate::units::{format_bytes, parse_journal_usage};
+use crate::units::{format_bytes, parse_brew_estimate, parse_journal_usage};
 
 /// Age passed to `journalctl --vacuum-time` (keep in sync with [`KnownCommand::JournalVacuum`]).
 const JOURNAL_KEEP: Duration = Duration::from_hours(7 * 24);
@@ -69,17 +69,30 @@ impl Scanner for HomebrewScanner {
             return Ok(Vec::new());
         };
         let path = PathBuf::from(out.trim());
-        Ok(measured_finding(
+        let Some(mut finding) = measured_finding(
             ctx,
             "homebrew",
             "homebrew:cache",
-            "Homebrew cache",
+            "Homebrew cleanup",
             path,
             KnownCommand::BrewCleanup,
-            "Downloaded bottles and old versions. Cleaned with `brew cleanup --prune=all`.",
-        )
-        .into_iter()
-        .collect())
+            "Downloaded bottles, old versions of formulae and casks, and dependencies nothing needs any more \
+             (brew cleanup also runs autoremove). Cleaned with `brew cleanup --prune=all`.",
+        ) else {
+            return Ok(Vec::new());
+        };
+        // Homebrew's own estimate also counts old kegs and unused dependencies outside the cache.
+        let estimate = ctx
+            .runner
+            .run(&argv(&["brew", "cleanup", "--prune=all", "--dry-run"]), Duration::from_mins(2))
+            .ok()
+            .filter(|o| o.success)
+            .and_then(|o| parse_brew_estimate(&o.stdout));
+        if let Some(bytes) = estimate {
+            finding.bytes = Some(bytes);
+            finding.detail.push_str(" Size is Homebrew's own estimate.");
+        }
+        Ok(vec![finding])
     }
 }
 
@@ -371,6 +384,22 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].path.as_deref(), Some(cache.as_path()));
         assert_eq!(found[0].action, Some(CleanupAction::Run(KnownCommand::BrewCleanup)));
+    }
+
+    #[test]
+    fn homebrew_uses_its_own_estimate_when_available() {
+        let env = Env::new();
+        let cache = env.home.join("Library/Caches/Homebrew");
+        env.file("Library/Caches/Homebrew/downloads/x.tar.gz", BIG);
+        let runner = FakeRunner::new().respond("brew --cache", true, &format!("{}\n", cache.display())).respond(
+            "brew cleanup --prune=all --dry-run",
+            true,
+            "Would remove: /opt/homebrew/Cellar/old/1.0 (10 files, 1.5GB)\n==> This operation would free approximately 2.2GB of disk space.\n",
+        );
+        let found = HomebrewScanner.scan(&env.ctx(Os::MacOs, &runner)).expect("scan");
+        assert_eq!(found[0].bytes, Some(2_200_000_000));
+        assert!(found[0].detail.ends_with("Size is Homebrew's own estimate."));
+        assert_eq!(found[0].title, "Homebrew cleanup");
     }
 
     #[test]
