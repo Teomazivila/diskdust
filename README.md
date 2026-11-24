@@ -1,10 +1,18 @@
 # diskdust
 
-A native desktop app (and CLI) that finds **non-obvious reclaimable disk space** on macOS and Linux —
-container data, `~/Library`, developer caches, old toolchains, build artifacts, installers, system
-caches — shows it grouped by category, size and age, and reclaims it safely.
+**Find the disk space hiding in caches, containers, build folders, and old toolchains.**
 
-Written in Rust (`eframe`/`egui`), one binary, no runtime dependencies.
+<p align="center">
+  <img src="docs/screenshots/scan-results.png" alt="diskdust scan results grouped by category, risk, and reclaimable size" width="1100">
+  <br>
+  <em>See what is taking space, what is safe to remove, and what deserves a closer look.</em>
+</p>
+
+**Read-only scans. Clear explanations. You choose what to remove.** diskdust is a native desktop app
+and CLI for macOS and Linux, written in Rust with no runtime dependencies.
+
+[Download the latest release](https://github.com/Teomazivila/diskdust/releases/latest) ·
+[See what it finds](#what-it-finds) · [Read the safety model](#safety-model)
 
 ## Install
 
@@ -18,30 +26,45 @@ Download the file for your system from the
 | Debian / Ubuntu | `diskdust_<version>_amd64.deb` / `_arm64.deb` | `sudo apt install ./diskdust_<version>_amd64.deb` |
 | Other Linux | `diskdust_<version>_x86_64.AppImage` / `_aarch64.AppImage` | `chmod +x` it and run it |
 
-The macOS build is signed ad hoc but **not notarized** yet, so Gatekeeper rejects a `.dmg`
-downloaded with a browser: double-clicking it does nothing useful. Remove the download quarantine
-from the disk image first, then install as usual (the app copied out of it is then not blocked):
+### macOS first launch
+
+The macOS app is ad-hoc signed, but has no **Developer ID signature** and is **not notarized**. For a
+browser-downloaded disk image, remove the quarantine attribute from that `.dmg`, then open it and
+drag **diskdust** to Applications. These commands use the current release (`0.2.1`) for Apple
+Silicon:
 
 ```sh
-xattr -d com.apple.quarantine ~/Downloads/diskdust_<version>_aarch64.dmg   # or _x64.dmg
-open ~/Downloads/diskdust_<version>_aarch64.dmg                            # drag to Applications
+xattr -d com.apple.quarantine ~/Downloads/diskdust_0.2.1_aarch64.dmg
+open ~/Downloads/diskdust_0.2.1_aarch64.dmg
 ```
 
-Or install from the terminal (`curl` does not quarantine downloads):
+For an Intel Mac, use `diskdust_0.2.1_x64.dmg` in both commands. Replace `0.2.1` with the version
+in your downloaded filename (for example, `0.1.0` for `diskdust_0.1.0_aarch64.dmg`). After the disk
+image opens, drag the app into **Applications**.
+
+Alternatively, install from Terminal. A `curl` download is not quarantined; this example verifies
+the release checksum before installing the Apple Silicon app:
 
 ```sh
+VERSION=0.2.1
+IMAGE="diskdust_${VERSION}_aarch64.dmg"
 cd /tmp
-curl -LO https://github.com/Teomazivila/diskdust/releases/download/v<version>/SHA256SUMS
-curl -LO https://github.com/Teomazivila/diskdust/releases/download/v<version>/diskdust_<version>_aarch64.dmg
+curl -fLO "https://github.com/Teomazivila/diskdust/releases/download/v${VERSION}/SHA256SUMS"
+curl -fLO "https://github.com/Teomazivila/diskdust/releases/download/v${VERSION}/${IMAGE}"
 shasum -a 256 -c SHA256SUMS --ignore-missing
-hdiutil attach -nobrowse diskdust_<version>_aarch64.dmg
+hdiutil attach -nobrowse "$IMAGE"
 ditto /Volumes/diskdust/diskdust.app /Applications/diskdust.app
 hdiutil detach /Volumes/diskdust
 ```
 
-If an already-installed copy is blocked on launch, use **System Settings → Privacy & Security →
-Open Anyway** or `xattr -d com.apple.quarantine /Applications/diskdust.app`. (Right-click → **Open**
-no longer bypasses Gatekeeper since macOS 15.)
+For an Intel Mac, set `IMAGE="diskdust_${VERSION}_x64.dmg"` instead.
+
+If macOS asks for **Full Disk Access**, enable diskdust in **System Settings → Privacy & Security →
+Full Disk Access**, then choose **Quit & Reopen** when prompted. This lets diskdust read protected
+items such as the Trash and some app data; scanning remains read-only.
+
+If macOS blocks an installed copy on launch, go to **System Settings → Privacy & Security → Open
+Anyway** when that option is offered.
 
 Each release lists `SHA256SUMS` and carries signed build provenance:
 `sha256sum -c SHA256SUMS --ignore-missing` and
@@ -81,6 +104,12 @@ not free them; the item says how much is shared. Every measured item shows when 
 was last modified.
 
 ## In the app
+
+<p align="center">
+  <img src="docs/screenshots/empty-state.png" alt="diskdust welcome screen with the Scan this Mac button" width="900">
+  <br>
+  <em>Start with a read-only scan. Nothing is removed unless you select items and confirm.</em>
+</p>
 
 - **Filter** by category, name/path, and age (*Untouched 7 / 30 / 90 / 180+ days*).
 - **Details panel** (click a row): what cleaning does, the full explanation, and *Largest folders*
@@ -192,6 +221,13 @@ output and `~/Downloads` for old installers. Because these folders are protected
 whether diskdust may access them; remove a folder under **Project folders** to skip it. The Trash and
 some app data are unreadable without *Full Disk Access*: the app shows a banner with a shortcut to
 the setting, reports those sizes as unknown and, for the Trash, asks Finder to empty it.
+
+After enabling Full Disk Access, choose **Quit & Reopen** so macOS restarts diskdust with the new
+permission:
+
+<p align="center">
+  <img src="docs/screenshots/macos-full-disk-access.png" alt="macOS Full Disk Access settings with diskdust enabled and the Quit and Reopen prompt" width="640">
+</p>
 
 ## Build from source
 
