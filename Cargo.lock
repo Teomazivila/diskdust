@@ -825,7 +825,7 @@ dependencies = [
 
 [[package]]
 name = "diskdust"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "dirs",
@@ -847,7 +847,7 @@ dependencies = [
 
 [[package]]
 name = "diskdust-core"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "plist",
  "proptest",
